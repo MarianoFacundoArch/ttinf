@@ -1,0 +1,35 @@
+# Data (downloaded on EC2)
+/data/
+/datasets/
+
+# Models
+models/*.bin
+models/*.pkl
+models/*.joblib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+*.egg
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Misc
+*.log
+*.tmp

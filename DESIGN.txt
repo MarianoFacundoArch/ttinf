@@ -1,0 +1,1135 @@
+================================================================================
+PREDICTXGBOOST v2 - DOCUMENTO DE DISENO COMPLETO
+================================================================================
+Fecha: 2026-03-11
+Autor: Mariano + Claude
+
+================================================================================
+1. OBJETIVO
+================================================================================
+
+Predecir cada 1 segundo la magnitud y direccion del movimiento de BTCUSDT
+dentro de 15 segundos (5 clases: STRONG_DOWN, DOWN, FLAT, UP, STRONG_UP).
+
+  Input:  estado actual del mercado + ultimos 120 segundos de historia
+  Output: 5 probabilidades: P(STRONG_DOWN), P(DOWN), P(FLAT), P(UP), P(STRONG_UP)
+
+  Si P(STRONG_UP) > threshold   -> long con confianza
+  Si P(STRONG_DOWN) > threshold -> short con confianza
+  Si P(FLAT) dominante          -> no operar
+
+El modelo se ejecuta cada 1 segundo en vivo.
+El dataset de entrenamiento se genera con 1 sample por segundo.
+
+  1 dia  =  86,400 samples
+  30 dias = 2,592,000 samples
+  90 dias = 7,776,000 samples
+
+================================================================================
+2. TARGET (lo que predecimos)
+================================================================================
+
+En cada instante T:
+
+  price_now    = midprice(T)     = (best_bid + best_ask) / 2
+  price_future = midprice(T+15s)
+
+  change_bps = (price_future - price_now) / price_now * 10000
+
+  THRESHOLDS (configurables):
+    T1 = 1.5 bps   (~$13 a precio de 87k)  umbral de ruido
+    T2 = 5.0 bps   (~$44 a precio de 87k)  umbral de movimiento fuerte
+
+  5 CLASES ORDINALES:
+
+    clase 0: STRONG_DOWN   change_bps < -T2           (caida fuerte)
+    clase 1: DOWN          change_bps ∈ [-T2, -T1)    (caida moderada)
+    clase 2: FLAT          change_bps ∈ [-T1, +T1]    (sin movimiento real)
+    clase 3: UP            change_bps ∈ (+T1, +T2]    (suba moderada)
+    clase 4: STRONG_UP     change_bps > +T2            (suba fuerte)
+
+Usamos midprice (no last trade) porque es mas estable y refleja el
+consenso del mercado en ese instante exacto.
+
+Por que 5 clases y no binario:
+  - Un movimiento de +1.6 bps y uno de +20 bps NO son lo mismo.
+    Con binario ambos son target=1 y el modelo los trata igual.
+    Para operar, +1.6 bps ni cubre comisiones; +20 bps es ganancia real.
+
+  - La clase FLAT es critica. Si no la entrenamos, el modelo nunca
+    aprende a decir "esto es ruido, no operar". Cuando el mercado esta
+    quieto, forzaria una prediccion UP o DOWN y generaria falsos
+    positivos que cuestan dinero.
+
+  - Las clases STRONG dan conviccion para operar con mas tamano o
+    confianza. Las clases UP/DOWN moderadas son señales mas debiles
+    que podemos filtrar o usar con menos exposicion.
+
+  Los thresholds T1=1.5 y T2=5.0 bps son puntos de partida. Se deben
+  calibrar empiricamente mirando la distribucion real de cambios a 15s.
+  Objetivo orientativo de distribucion:
+    STRONG_DOWN: ~10-15%
+    DOWN:        ~15-20%
+    FLAT:        ~30-40%
+    UP:          ~15-20%
+    STRONG_UP:   ~10-15%
+
+  En inferencia live, el modelo devuelve 5 probabilidades que suman 1:
+    P(STRONG_DOWN), P(DOWN), P(FLAT), P(UP), P(STRONG_UP)
+
+  Decisiones de trading:
+    - P(STRONG_UP) > threshold   → long con confianza
+    - P(STRONG_DOWN) > threshold → short con confianza
+    - P(FLAT) alto               → no operar
+    - Combinaciones: P(UP) + P(STRONG_UP) vs P(DOWN) + P(STRONG_DOWN)
+      para señal direccional ponderada
+
+================================================================================
+3. PRINCIPIO FUNDAMENTAL: TODO RELATIVO
+================================================================================
+
+Los modelos de arboles (como LightGBM) usan thresholds fijos en los
+splits. Si un split aprendio "price > 87000 -> UP", cuando BTC valga
+120k ese split es basura.
+
+REGLA: ningun feature contiene un precio, volumen, o cantidad absoluta.
+TODO es: porcentajes, ratios, z-scores, bps, o flags binarios.
+
+Ejemplos:
+  MAL:  price = 87,451              BIEN: return_5s = +0.012%
+  MAL:  spread = $1.0               BIEN: spread_bps = 1.14
+  MAL:  signed_vol = 3.8 BTC        BIEN: signed_vol_zscore = +2.1 sigma
+  MAL:  bid_depth = 45 BTC          BIEN: bid_depth_ratio = 0.60
+  MAL:  open_interest = 77,329 BTC  BIEN: oi_change_pct = +0.15%
+
+Para volumenes y cantidades que dependen del regimen de mercado, se
+normalizan contra la actividad reciente (z-score sobre ventana de 60s
+o ratio contra el total).
+
+================================================================================
+4. FUENTES DE DATOS (CAPTURA)
+================================================================================
+
+10 fuentes de datos, 8 websocket + 3 REST.
+
+--- WEBSOCKETS ---
+
+SPOT (wss://stream.binance.com:9443/ws):
+
+  1. btcusdt@aggTrade              Tick-by-tick
+     Trades agregados spot.
+     Campos: timestamp_ms, price, qty, is_buyer_maker, agg_trade_id
+
+  2. btcusdt@depth20@100ms         Cada 100ms
+     Top 20 niveles bid/ask del order book spot.
+     Campos: timestamp_ms, bids[20][price, qty], asks[20][price, qty]
+
+  3. btcusdt@bookTicker            Real-time (cada cambio)
+     Best bid/ask spot. El dato mas rapido que existe.
+     Campos: timestamp_ms, best_bid_price, best_bid_qty,
+             best_ask_price, best_ask_qty
+
+FUTURES USD-M (wss://fstream.binance.com/ws):
+
+  4. btcusdt@aggTrade              Tick-by-tick
+     Trades agregados futuros.
+     Mismos campos que spot.
+
+  5. btcusdt@depth20@100ms         Cada 100ms
+     Top 20 niveles bid/ask del order book futuros.
+     Mismos campos que spot.
+
+  6. btcusdt@bookTicker            Real-time (cada cambio)
+     Best bid/ask futuros.
+     Mismos campos que spot.
+
+  7. btcusdt@markPrice@1s          Cada 1 segundo
+     Mark price, index price, funding rate.
+     Campos: timestamp_ms, mark_price, index_price,
+             funding_rate, next_funding_time_ms
+
+  8. btcusdt@forceOrder            Evento por evento
+     Liquidaciones de posiciones.
+     Campos: timestamp_ms, side (BUY/SELL), price, qty,
+             avg_price, filled_qty, status
+
+--- REST POLLING ---
+
+  9. Open Interest                 Cada 30 segundos
+     GET /fapi/v1/openInterest?symbol=BTCUSDT
+     Campos: timestamp_ms, open_interest (BTC)
+
+  10. Long/Short Ratio Global      Cada 60 segundos
+      GET /futures/data/globalLongShortAccountRatio
+      Campos: timestamp_ms, long_short_ratio, long_account, short_account
+
+  11. Long/Short Ratio Top Traders Cada 60 segundos
+      GET /futures/data/topLongShortAccountRatio
+      Campos: timestamp_ms, long_short_ratio, long_account, short_account
+
+--- DATOS HISTORICOS (Binance Data Vision) ---
+
+Para entrenamiento offline, descargamos de data.binance.vision:
+
+  - aggTrades spot         (tick-by-tick)    data/spot/daily/aggTrades/
+  - aggTrades futures      (tick-by-tick)    data/futures/um/daily/aggTrades/
+  - klines spot 1m         (cada 1 min)      data/spot/daily/klines/BTCUSDT/1m/
+  - klines futures 1m      (cada 1 min)      data/futures/um/daily/klines/BTCUSDT/1m/
+  - markPriceKlines 1m     (cada 1 min)      data/futures/um/daily/markPriceKlines/BTCUSDT/1m/
+  - premiumIndexKlines 1m  (cada 1 min)      data/futures/um/daily/premiumIndexKlines/BTCUSDT/1m/
+  - bookDepth              (cada ~30s)       data/futures/um/daily/bookDepth/
+  - bookTicker             (tick-by-tick)    data/futures/um/daily/bookTicker/
+  - metrics                (cada 5 min)      data/futures/um/daily/metrics/
+    Contiene: open_interest, top_trader_long_short, long_short_ratio,
+              taker_long_short_vol_ratio
+
+NOTA: el order book historico de Binance Data Vision es "bookDepth" con
+profundidad agregada por porcentaje (+-0.2%, +-1%, ..., +-5%), NO es el
+depth20 nivel por nivel. Es menos granular que lo que capturamos en vivo.
+Los features de order book entrenados offline seran mas limitados.
+
+================================================================================
+5. FEATURES - DETALLE COMPLETO
+================================================================================
+
+Todos los features se calculan en el instante T, mirando como maximo
+120 segundos hacia atras. NINGUN feature mira hacia adelante.
+
+Nomenclatura:
+  _Ns  = lookback de N segundos (ej: _5s = ultimos 5 segundos)
+  spot = mercado spot
+  fut  = mercado futuros
+  L1, L5, L10, L20 = niveles del order book
+
+Lookbacks estandar: [1s, 3s, 5s, 10s, 30s, 60s]
+Lookbacks book:     [1s, 3s, 5s, 10s, 30s]
+
+--------------------------------------------------------------------------------
+GRUPO 1: ORDER BOOK SNAPSHOT (estado actual)
+--------------------------------------------------------------------------------
+Fuente: depth20 spot + futures (ultimo snapshot disponible)
+
+Spot:
+  spot_spread_bps               (best_ask - best_bid) / mid * 10000
+  spot_microprice_dist          (microprice - mid) / mid * 10000
+                                microprice = (bid*ask_qty + ask*bid_qty) / (bid_qty + ask_qty)
+  spot_imbalance_L1             (bid_qty_1 - ask_qty_1) / (bid_qty_1 + ask_qty_1)
+  spot_imbalance_L5             idem top 5 niveles
+  spot_imbalance_L10            idem top 10 niveles
+  spot_imbalance_L20            idem top 20 niveles
+  spot_bid_depth_ratio          sum(bid_qty_20) / (sum(bid_qty_20) + sum(ask_qty_20))
+  spot_depth_concentration_bid  qty_L1 / sum(qty_L20) del lado bid
+  spot_depth_concentration_ask  qty_L1 / sum(qty_L20) del lado ask
+  spot_wall_bid                 1 si algun bid_qty > mean + 3*std, 0 si no
+  spot_wall_ask                 1 si algun ask_qty > mean + 3*std, 0 si no
+
+Futures (mismos 11 features, prefijo "fut_"):
+  fut_spread_bps
+  fut_microprice_dist
+  fut_imbalance_L1 ... L20
+  fut_bid_depth_ratio
+  fut_depth_concentration_bid/ask
+  fut_wall_bid/ask
+
+Cross (spot vs futures):
+  basis_bps                     (fut_mid - spot_mid) / spot_mid * 10000
+  spread_diff_bps               fut_spread_bps - spot_spread_bps
+  imbalance_diff_L5             fut_imbalance_L5 - spot_imbalance_L5
+
+Subtotal: 25 features
+
+--------------------------------------------------------------------------------
+GRUPO 2: ORDER BOOK DINAMICA (como cambio el book)
+--------------------------------------------------------------------------------
+Fuente: comparacion de snapshots depth20 a lo largo del tiempo
+
+Para cada lookback [1s, 3s, 5s, 10s, 30s]:
+
+  Spot:
+    spot_imbalance_L5_delta_{N}s      imbalance_L5 ahora - imbalance_L5 hace N seg
+    spot_bid_depth_ratio_delta_{N}s   bid_depth_ratio ahora - hace N seg
+    spot_spread_delta_bps_{N}s        spread_bps ahora - hace N seg
+    spot_microprice_move_{N}s         microprice ahora vs hace N seg (en bps)
+
+  Futures (mismos 4, prefijo "fut_"):
+    fut_imbalance_L5_delta_{N}s
+    fut_bid_depth_ratio_delta_{N}s
+    fut_spread_delta_bps_{N}s
+    fut_microprice_move_{N}s
+
+5 lookbacks x 4 features x 2 mercados = 40 features
+
+Cross:
+  basis_delta_{N}s              cambio en basis en ultimos N seg (5 valores)
+
+Subtotal: 45 features
+
+--------------------------------------------------------------------------------
+GRUPO 3: TRADE FLOW (flujo de ordenes)
+--------------------------------------------------------------------------------
+Fuente: aggTrades spot + futures
+
+Para cada lookback [1s, 3s, 5s, 10s, 30s, 60s]:
+
+  Spot:
+    spot_buy_pct_{N}s               buy_vol / total_vol (0 a 1)
+    spot_signed_vol_zscore_{N}s     (buy_vol - sell_vol) normalizado:
+                                    z-score contra media/std de ventana 60s
+    spot_trade_intensity_{N}s       trade_count / N (trades por segundo)
+                                    normalizado: ratio vs intensidad 60s
+    spot_avg_size_ratio_{N}s        avg_trade_size / median_trade_size_60s
+    spot_large_trade_imb_{N}s       (large_buys - large_sells) / total_large_trades
+                                    large = qty > P95 de la ventana 60s
+
+  Futures (mismos 5, prefijo "fut_"):
+    fut_buy_pct_{N}s
+    fut_signed_vol_zscore_{N}s
+    fut_trade_intensity_{N}s
+    fut_avg_size_ratio_{N}s
+    fut_large_trade_imb_{N}s
+
+6 lookbacks x 5 features x 2 mercados = 60 features
+
+Cross:
+  fut_spot_vol_ratio_{N}s       fut_volume / spot_volume para cada lookback
+                                (quien lidera en actividad?)
+
+6 lookbacks x 1 = 6 features
+
+Subtotal: 66 features
+
+--------------------------------------------------------------------------------
+GRUPO 4: PRICE MOMENTUM
+--------------------------------------------------------------------------------
+Fuente: aggTrades (o bookTicker) spot
+
+Para cada lookback [1s, 3s, 5s, 10s, 30s, 60s]:
+  return_{N}s                   (price_now - price_Ns_ago) / price_Ns_ago
+  realized_vol_{N}s             std(returns tick-a-tick) en esa ventana
+
+Derivados:
+  price_slope_10s               pendiente regresion lineal sobre returns ultimos 10s
+  price_slope_30s               idem 30s
+  price_acceleration            slope_10s - slope_30s
+  return_skew_30s               skewness de returns en 30s
+  return_skew_60s               skewness de returns en 60s
+  max_drawdown_60s              maximo drawdown relativo en 60s
+  max_runup_60s                 maximo runup relativo en 60s
+
+Futures price vs spot:
+  fut_return_{N}s               return del precio futuros (6 lookbacks)
+  fut_leads_spot_{N}s           fut_return_{N}s - spot_return_{N}s
+                                positivo = futuros subieron mas = futuros lideran
+
+6 + 6 + 5 + 2 + 6 + 6 = 31 features
+
+Subtotal: 31 features
+
+--------------------------------------------------------------------------------
+GRUPO 5: BOOK TICKER (best bid/ask en real-time)
+--------------------------------------------------------------------------------
+Fuente: bookTicker spot + futures
+
+  spot_mid_vs_depth_mid         midprice de bookTicker vs midprice de depth20
+                                (diferencia en bps, detecta micro-movimientos)
+  fut_mid_vs_depth_mid          idem futuros
+
+  spot_bookticker_updates_{N}s  cantidad de updates en N seg (para N=1s, 5s, 10s)
+  fut_bookticker_updates_{N}s   idem (actividad del top of book)
+
+  spot_bid_ask_flip_rate_{N}s   veces que best_bid o best_ask cambio / N
+  fut_bid_ask_flip_rate_{N}s    idem
+
+2 + 6 + 6 = 14 features
+
+Subtotal: 14 features
+
+--------------------------------------------------------------------------------
+GRUPO 6: DERIVADOS (contexto)
+--------------------------------------------------------------------------------
+Fuente: markPrice, forceOrder, REST endpoints
+
+Funding y basis:
+  funding_rate                  tasa de funding actual
+  funding_rate_annualized       funding_rate * 3 * 365 (para comparacion)
+  basis_bps                     (ya en grupo 1, no duplicar)
+  mark_vs_index_bps             (mark_price - index_price) / index_price * 10000
+  premium_index_bps             del premiumIndexKlines si disponible
+
+Liquidaciones (ultimos 60 segundos):
+  liq_buy_vol_ratio             liq_buy_vol / avg_trade_vol_60s
+                                (liquidaciones de shorts relativo al volumen normal)
+  liq_sell_vol_ratio            liq_sell_vol / avg_trade_vol_60s
+  liq_net_ratio                 (liq_buy - liq_sell) / avg_trade_vol_60s
+  liq_count_60s                 cantidad total de liquidaciones
+  liq_is_cascading              1 si liq_count > 3 en ultimos 30s (cascada)
+
+Open Interest:
+  oi_change_pct                 cambio % de OI vs lectura anterior
+  oi_change_pct_5m              cambio % de OI en ultimos 5 min (si hay datos)
+
+Posicionamiento:
+  long_short_ratio              ratio global actual
+  top_trader_long_short         ratio top traders actual
+  long_short_change             cambio en ratio vs lectura anterior
+  taker_long_short_vol_ratio    ratio de volumen taker buy/sell (de metrics)
+
+Subtotal: 15 features (sin contar basis que ya esta en grupo 1)
+
+--------------------------------------------------------------------------------
+GRUPO 7: VOLATILIDAD / REGIMEN
+--------------------------------------------------------------------------------
+Fuente: calculado de los datos de precio y volumen
+
+  vol_ratio_10s_60s             realized_vol_10s / realized_vol_60s
+                                >1 = expansion de volatilidad
+                                <1 = contraccion
+  spread_vs_mean_60s            spread_bps actual / mean(spread_bps) ultimos 60s
+                                >1 = spread ensanchandose (estres)
+  activity_ratio                trades_per_sec_10s / trades_per_sec_60s
+                                >1 = actividad creciente
+  book_depth_vs_mean_60s        depth total actual / mean(depth) ultimos 60s
+                                <1 = book vaciandose (peligro)
+  price_range_60s_bps           (max - min) / mid * 10000 en ultimos 60s
+  price_range_10s_bps           idem 10s
+  range_ratio                   range_10s / range_60s (expansion de rango reciente)
+
+Subtotal: 7 features
+
+--------------------------------------------------------------------------------
+GRUPO 8: TEMPORAL
+--------------------------------------------------------------------------------
+Fuente: timestamp actual
+
+  hour_sin                      sin(2*pi*hour/24)   (ciclico)
+  hour_cos                      cos(2*pi*hour/24)   (ciclico)
+  dow_sin                       sin(2*pi*dow/7)     (ciclico)
+  dow_cos                       cos(2*pi*dow/7)     (ciclico)
+  is_weekend                    1 si sabado/domingo
+  session_asia                  1 si 00-08 UTC
+  session_europe                1 si 08-16 UTC
+  session_us                    1 si 13-21 UTC
+  session_overlap               1 si 13-16 UTC (EU+US overlap)
+  minutes_to_funding            minutos hasta proximo funding settlement (cada 8h)
+
+NOTA: hour_sin/cos es mejor que hour_of_day para modelos de arboles
+porque captura que hora 23 esta cerca de hora 0 (ciclico), en vez de
+tratarlas como distantes (23 vs 0).
+
+Subtotal: 10 features
+
+--------------------------------------------------------------------------------
+RESUMEN DE FEATURES
+--------------------------------------------------------------------------------
+
+  Grupo 1: Order book snapshot         25 features
+  Grupo 2: Order book dinamica         45 features
+  Grupo 3: Trade flow                  66 features
+  Grupo 4: Price momentum              31 features
+  Grupo 5: Book ticker                 14 features
+  Grupo 6: Derivados                   15 features
+  Grupo 7: Volatilidad / regimen        7 features
+  Grupo 8: Temporal                    10 features
+  ─────────────────────────────────────────────────
+  TOTAL ESTIMADO:                     ~213 features
+
+El conteo exacto se definira en implementacion. Puede variar +-10%.
+
+================================================================================
+6. ARQUITECTURA DEL SISTEMA
+================================================================================
+
+Tres componentes principales:
+
+  A. Captura (24/7)
+  B. Generacion de dataset + entrenamiento (offline)
+  C. Prediccion en vivo (live)
+
+--- A. CAPTURA ---
+
+  Corre 24/7 en background.
+  Recibe datos de los 10 streams y los guarda en parquet.
+  Particionado por dia: data/raw/YYYY-MM-DD/<stream>/chunk_*.parquet
+
+  Tambien se puede poblar con datos historicos de Binance Data Vision
+  para tener un dataset inicial sin esperar semanas de captura.
+
+  Almacenamiento estimado: ~2-4 GB/dia
+  (el order book a 100ms es lo mas pesado)
+
+--- B. GENERACION DE DATASET + ENTRENAMIENTO ---
+
+  Ver seccion 6B para detalle completo del proceso de generacion.
+
+--- C. PREDICCION EN VIVO ---
+
+  1. Conectar a los 10 streams
+  2. Mantener buffers circulares de 120 segundos para cada stream
+  3. Cada 1 segundo:
+     a. Calcular los ~213 features desde los buffers
+     b. Pasar al modelo LightGBM (multiclass, 5 clases)
+     c. Obtener 5 probabilidades
+     d. Mostrar:
+        T=16:35:42 | Price: 87,451.5 | SD:0.03 D:0.08 F:0.15 U:0.34 SU:0.40 | STRONG_UP
+  4. Los buffers descartan datos de mas de 120 segundos
+
+  Latencia objetivo: <50ms desde que llega el tick hasta prediccion.
+  LightGBM con ~213 features: inferencia <1ms.
+
+================================================================================
+6B. GENERACION DE DATASET - DETALLE COMPLETO
+================================================================================
+
+El dataset de entrenamiento se genera OFFLINE a partir de los datos crudos
+capturados. Es un proceso de tres fases: cargar datos crudos, iterar
+segundo a segundo generando samples, y guardar el resultado.
+
+--- FASE 1: DATOS CRUDOS (lo que esta en disco) ---
+
+La captura guarda eventos tal cual llegan, sin procesar. Cada stream
+tiene su propia carpeta con archivos parquet particionados por dia.
+
+Ejemplo de lo que hay en disco para un dia:
+
+  data/raw/2026-03-11/trades_spot/chunk_143022_1741700000.parquet
+  ┌───────────────┬──────────┬───────┬────────────────┬──────────────┐
+  │ timestamp_ms  │ price    │ qty   │ is_buyer_maker │ agg_trade_id │
+  ├───────────────┼──────────┼───────┼────────────────┼──────────────┤
+  │ 1741700000001 │ 87451.0  │ 0.30  │ false          │ 389221001    │
+  │ 1741700000015 │ 87451.5  │ 0.12  │ false          │ 389221002    │
+  │ 1741700000031 │ 87451.0  │ 1.80  │ true           │ 389221003    │
+  │ 1741700000044 │ 87450.5  │ 0.05  │ true           │ 389221004    │
+  │ ...           │ ...      │ ...   │ ...            │ ...          │
+  └───────────────┴──────────┴───────┴────────────────┴──────────────┘
+  → Miles de filas por minuto. ~1.5M trades spot por dia.
+
+  data/raw/2026-03-11/orderbook_spot/chunk_143022_1741700000.parquet
+  ┌───────────────┬──────┬───────┬──────────┬───────┐
+  │ timestamp_ms  │ side │ level │ price    │ qty   │
+  ├───────────────┼──────┼───────┼──────────┼───────┤
+  │ 1741700000100 │ bid  │ 0     │ 87450.0  │ 2.50  │
+  │ 1741700000100 │ bid  │ 1     │ 87449.0  │ 1.20  │
+  │ 1741700000100 │ bid  │ 2     │ 87448.0  │ 0.80  │
+  │ ...           │ ...  │ ...   │ ...      │ ...   │  (20 bids)
+  │ 1741700000100 │ ask  │ 0     │ 87451.0  │ 1.80  │
+  │ 1741700000100 │ ask  │ 1     │ 87452.0  │ 3.10  │
+  │ ...           │ ...  │ ...   │ ...      │ ...   │  (20 asks)
+  │ 1741700000200 │ bid  │ 0     │ 87450.5  │ 2.30  │  ← 100ms despues
+  │ ...           │ ...  │ ...   │ ...      │ ...   │
+  └───────────────┴──────┴───────┴──────────┴───────┘
+  → 40 filas por snapshot x 10 snapshots/seg = 400 filas/seg.
+  → ~34.5M filas de order book spot por dia.
+
+  data/raw/2026-03-11/bookticker_spot/chunk_143022_1741700000.parquet
+  ┌───────────────┬────────────┬──────────┬────────────┬──────────┐
+  │ timestamp_ms  │ bid_price  │ bid_qty  │ ask_price  │ ask_qty  │
+  ├───────────────┼────────────┼──────────┼────────────┼──────────┤
+  │ 1741700000005 │ 87450.0    │ 2.50     │ 87451.0    │ 1.80     │
+  │ 1741700000018 │ 87450.5    │ 1.90     │ 87451.0    │ 1.80     │
+  │ ...           │ ...        │ ...      │ ...        │ ...      │
+  └───────────────┴────────────┴──────────┴────────────┴──────────┘
+  → 1 fila por cada cambio en best bid/ask. ~500-2000 updates/seg.
+
+  (Y lo mismo para trades_futures, orderbook_futures, bookticker_futures,
+   mark_price, liquidations, open_interest, long_short)
+
+--- FASE 2: GENERACION DE SAMPLES (1 por segundo) ---
+
+El script build_dataset.py procesa los datos crudos y genera 1 training
+sample por cada segundo. El proceso:
+
+  ALGORITMO:
+
+  1. Cargar todos los parquets de un dia en memoria
+     (o procesarlo por chunks de 1 hora si no entra en RAM)
+
+  2. Pre-indexar por timestamp para busqueda rapida:
+     - trades: ya estan ordenados por timestamp_ms
+     - orderbook: agrupar snapshots por timestamp_ms
+     - bookticker: ordenado por timestamp_ms
+     - etc.
+
+  3. Iterar segundo a segundo:
+
+     Para T = dia_start + 120s ... dia_end - 15s:
+     (empezamos en +120s porque necesitamos lookback,
+      terminamos en -15s porque necesitamos el target futuro)
+
+       a) Obtener midprice(T):
+          - Buscar el ultimo bookTicker con timestamp_ms <= T
+          - midprice_T = (bid_price + ask_price) / 2
+          - Si no hay datos en los ultimos 5 segundos → skip sample
+
+       b) Obtener midprice(T+15s):
+          - Buscar el ultimo bookTicker con timestamp_ms <= T+15000
+          - midprice_T15 = (bid_price + ask_price) / 2
+          - Si no hay datos en los ultimos 5 segundos → skip sample
+
+       c) Calcular target (5 clases):
+          - change_bps = (midprice_T15 - midprice_T) / midprice_T * 10000
+          - Si change_bps < -T2             → target = 0 (STRONG_DOWN)
+          - Si change_bps ∈ [-T2, -T1)      → target = 1 (DOWN)
+          - Si change_bps ∈ [-T1, +T1]      → target = 2 (FLAT)
+          - Si change_bps ∈ (+T1, +T2]      → target = 3 (UP)
+          - Si change_bps > +T2             → target = 4 (STRONG_UP)
+
+       d) Calcular features (llamar a feature_engine):
+          - Filtrar trades spot donde timestamp_ms in [T-120s, T]
+          - Filtrar trades futures idem
+          - Buscar ultimo snapshot de orderbook spot con ts <= T
+          - Buscar snapshot de orderbook spot de hace 1s, 3s, 5s, 10s, 30s
+          - Idem para orderbook futures
+          - Filtrar bookTicker spot/futures in [T-120s, T]
+          - Buscar ultimo mark_price con ts <= T
+          - Filtrar liquidaciones in [T-60s, T]
+          - Buscar ultimo open_interest con ts <= T
+          - Buscar ultimo long_short con ts <= T
+          - Pasar todo al feature_engine → dict de ~213 features
+
+       e) Guardar fila:
+          {timestamp_ms: T, target: 0..4, change_bps: val, feat_1: val, ..., feat_213: val}
+
+  EJEMPLO DE 4 SAMPLES CONSECUTIVOS:
+
+  T = 16:35:40.000 (timestamp_ms = 1741711740000)
+    Lookback: datos de 16:33:40 a 16:35:40
+    midprice(T)    = 87,451.0
+    midprice(T+15) = 87,453.0  (16:35:55)
+    change_bps = +2.29 → target = 3 (UP, entre +T1 y +T2)
+    features = {
+      spot_spread_bps: 1.14,
+      spot_imbalance_L5: +0.32,
+      spot_buy_pct_5s: 0.85,
+      return_5s: +0.012%,
+      fut_signed_vol_zscore_5s: +1.8,
+      basis_bps: +2.3,
+      ...213 valores...
+    }
+
+  T = 16:35:41.000 (1 segundo despues)
+    Lookback: datos de 16:33:41 a 16:35:41
+    midprice(T)    = 87,451.5
+    midprice(T+15) = 87,452.0  (16:35:56)
+    change_bps = +0.57 → target = 2 (FLAT, dentro de [-T1, +T1])
+    features = {
+      spot_spread_bps: 1.02,      ← cambio: spread se achico
+      spot_imbalance_L5: +0.28,   ← cambio: un poco menos bullish
+      spot_buy_pct_5s: 0.82,      ← cambio: sigue comprando, un poco menos
+      return_5s: +0.008%,         ← cambio: el return de 5s es distinto
+      ...
+    }
+
+  T = 16:35:42.000 (otro segundo)
+    Lookback: datos de 16:33:42 a 16:35:42
+    midprice(T)    = 87,452.0
+    midprice(T+15) = 87,450.0  (16:35:57)
+    change_bps = -2.29 → target = 1 (DOWN, entre -T2 y -T1)
+    features = {
+      spot_spread_bps: 1.55,      ← spread se ensancho (señal de estres)
+      spot_imbalance_L5: -0.10,   ← giro: ahora mas asks que bids
+      spot_buy_pct_5s: 0.45,      ← giro: vendedores dominan
+      return_5s: -0.003%,
+      ...
+    }
+
+  NOTA: cada sample se superpone con el anterior. La ventana de 120s se
+  desliza 1 segundo. Los lookbacks cortos (1s, 3s) cambian mucho entre
+  samples. Los lookbacks largos (60s) cambian poco. Esto es correcto:
+  hay alta autocorrelacion entre samples consecutivos, pero el TARGET
+  puede cambiar drasticamente de un segundo a otro.
+
+  SAMPLES SKIPPED (no se generan):
+  - Primeros 120 segundos del dia (no hay lookback suficiente)
+  - Ultimos 15 segundos del dia (no hay target futuro)
+  - Segundos donde no hay datos de bookTicker reciente (gap de conexion)
+
+  SAMPLES POR DIA:
+  86,400 seg/dia - 120 (lookback) - 15 (target) - skips conexion
+  ≈ 86,000 samples/dia (~2.6M por mes)
+  Todos los samples se usan, incluyendo FLAT.
+
+--- FASE 3: DATASET FINAL (lo que queda en disco) ---
+
+  data/dataset/training_data.parquet
+
+  ┌───────────────┬────────┬────────────┬─────────────────┬───────────────────┬─────┐
+  │ timestamp_ms  │ target │ change_bps │ spot_spread_bps │ spot_imbalance_L1 │ ... │
+  ├───────────────┼────────┼────────────┼─────────────────┼───────────────────┼─────┤
+  │ 1741700120000 │ 3      │ +2.29      │ 1.14            │ +0.16             │ ... │
+  │ 1741700121000 │ 2      │ +0.57      │ 1.02            │ +0.14             │ ... │
+  │ 1741700122000 │ 1      │ -2.29      │ 1.55            │ -0.05             │ ... │
+  │ 1741700123000 │ 4      │ +7.10      │ 1.30            │ +0.08             │ ... │
+  │ ...           │ ...    │ ...        │ ...             │ ...               │ ... │
+  └───────────────┴────────┴────────────┴─────────────────┴───────────────────┴─────┘
+
+  target: 0=STRONG_DOWN, 1=DOWN, 2=FLAT, 3=UP, 4=STRONG_UP
+
+  Columnas: timestamp_ms + target + change_bps + ~213 features = ~216 columnas
+  (change_bps se guarda para analisis pero NO se usa como feature)
+  Filas: ~86,000 por dia, ~2,580,000 por mes
+  Tamaño estimado: ~500 MB por mes (float64, comprimido snappy)
+
+  Cada fila es INDEPENDIENTE. Contiene toda la informacion necesaria.
+  Ya no se necesitan los datos crudos para entrenar. El dataset es
+  autocontenido.
+
+--- OPTIMIZACIONES DE BUILD_DATASET ---
+
+  Recalcular todo de cero para cada segundo seria extremadamente lento.
+  Optimizaciones criticas:
+
+  1. CARGAR DIA COMPLETO EN MEMORIA
+     Cargar todos los parquets de un dia. El order book es lo mas pesado
+     (~34M filas/dia spot + futures). Si no entra en RAM, procesar por
+     chunks de 1 hora con overlap de 120s al inicio.
+
+  2. PRE-INDEXAR POR TIMESTAMP
+     Crear un indice (ej: sorted array de timestamps) para hacer busqueda
+     binaria O(log n) en vez de filtrado lineal O(n).
+     Para buscar "ultimo snapshot de book antes de T":
+       idx = np.searchsorted(book_timestamps, T, side='right') - 1
+
+  3. VENTANA DESLIZANTE
+     Al avanzar de T a T+1s, la mayoria de los datos en la ventana de
+     120s son los mismos. Solo cambia:
+       - Se agrega ~1 segundo de datos nuevos por la derecha
+       - Se quita ~1 segundo de datos viejos por la izquierda
+     Para lookbacks cortos (1s, 3s), los datos cambian completamente.
+     Para lookbacks largos (60s), cambia <2% de los datos.
+     No se recalcula todo: se mantienen acumuladores incrementales donde
+     sea posible (ej: conteo de trades, suma de volumen).
+
+  4. PARALELIZAR POR DIA
+     Cada dia es independiente (excepto los 120s de overlap al inicio).
+     Se pueden procesar multiples dias en paralelo con multiprocessing.
+
+  5. BATCH DE FEATURES
+     En vez de calcular cada feature individualmente con filtrados de
+     pandas, agrupar operaciones similares:
+       - Todos los lookbacks de trades en un solo pass
+       - Todos los lookbacks de order book en un solo pass
+
+  TIEMPO ESTIMADO:
+    Sin optimizar: ~30-60 min por dia
+    Optimizado:    ~5-10 min por dia
+    30 dias:       ~3-5 horas total
+
+--- PIPELINE COMPLETO DE DATOS ---
+
+  CAPTURA (24/7)                  BUILD DATASET (offline)              TRAIN
+  ──────────────                  ──────────────────────               ─────
+
+  Binance WS → trades_spot     ─┐
+  Binance WS → trades_fut      ─┤
+  Binance WS → book_spot       ─┤
+  Binance WS → book_fut        ─┤  Para cada segundo T:
+  Binance WS → bookticker_spot ─┤  ┌───────────────────────┐
+  Binance WS → bookticker_fut  ─┼→ │ 1. midprice(T)        │        dataset
+  Binance WS → markprice       ─┤  │ 2. midprice(T+15s)    │  ──→  .parquet ──→ LightGBM
+  Binance WS → liquidations    ─┤  │ 3. features(T-120..T) │
+  Binance REST → oi            ─┤  │ 4. target = 0..4      │
+  Binance REST → longshort     ─┘  └───────────────────────┘
+
+  Datos crudos                    Features pre-calculados              Modelo
+  (~2-4 GB/dia)                   (~500 MB/mes)                       (~10 MB)
+
+================================================================================
+7. MODELO: LightGBM
+================================================================================
+
+--- POR QUE LIGHTGBM (y no XGBoost) ---
+
+  Para este proyecto, LightGBM es mejor que XGBoost:
+
+  1. TRAINING 5-10x MAS RAPIDO
+     LightGBM usa histogram-based splitting y crece leaf-wise (en vez
+     de level-wise como XGBoost). Con 2.6M+ samples, entrenar toma
+     ~2-4 min en vez de ~15-20 min. Importa cuando re-entrenas seguido.
+
+  2. MENOR USO DE RAM
+     Histogram binning (256 bins por defecto) consume mucho menos
+     memoria que los splits exactos de XGBoost. En un MacBook con
+     datasets de millones de filas, esto importa.
+
+  3. INFERENCIA MAS RAPIDA
+     ~0.5-1ms por sample vs ~1-3ms de XGBoost. Para prediccion cada
+     1 segundo esto da margen.
+
+  4. MISMA ACCURACY
+     Para datos tabulares numericos, ambos producen resultados
+     practicamente identicos. No hay razon para elegir el mas lento.
+
+  5. MANEJO NATIVO DE NaN
+     LightGBM maneja NaN nativamente (usa el hijo con mayor ganancia).
+     Critico porque nuestro dataset tiene NaN en features de streams
+     secundarios (liquidaciones, OI, long/short).
+
+--- HIPERPARAMETROS INICIALES ---
+
+LightGBM:
+  objective:          multiclass
+  num_class:          5
+  metric:             multi_logloss
+  boosting_type:      gbdt
+  num_leaves:         63        (equivalente a ~max_depth 6)
+  learning_rate:      0.03
+  n_estimators:       2000      (con early stopping)
+  early_stopping_rounds: 100
+  subsample:          0.8       (bagging_fraction)
+  subsample_freq:     1         (bagging cada iteracion)
+  colsample_bytree:   0.7       (feature_fraction)
+  min_child_samples:  100       (alto: millones de samples, evita overfitting)
+  reg_alpha:          0.1       (L1 regularization)
+  reg_lambda:         1.0       (L2 regularization)
+  max_bin:            255       (histogram bins, default)
+  verbose:            -1
+  seed:               42
+
+Notas:
+  - num_leaves=63 es el control principal de complejidad en LightGBM
+    (en vez de max_depth). Leaf-wise growth con 63 hojas da arboles
+    de profundidad ~6 pero mas flexibles.
+  - min_child_samples=100 es alto porque con ~2.6M samples por mes,
+    necesitamos hojas con suficiente evidencia estadistica.
+  - learning_rate bajo + n_estimators alto + early stopping es mejor
+    que learning_rate alto + pocos rounds.
+  - colsample_bytree=0.7 para reducir correlacion entre arboles.
+
+--- TRAINING CODE (pseudocodigo) ---
+
+  import lightgbm as lgb
+
+  dtrain = lgb.Dataset(X_train, label=y_train)
+  dval   = lgb.Dataset(X_test, label=y_test, reference=dtrain)
+
+  params = {
+      "objective": "multiclass",
+      "num_class": 5,
+      "metric": "multi_logloss",
+      "boosting_type": "gbdt",
+      "num_leaves": 63,
+      "learning_rate": 0.03,
+      "subsample": 0.8,
+      "subsample_freq": 1,
+      "colsample_bytree": 0.7,
+      "min_child_samples": 100,
+      "reg_alpha": 0.1,
+      "reg_lambda": 1.0,
+      "verbose": -1,
+      "seed": 42,
+  }
+
+  model = lgb.train(
+      params,
+      dtrain,
+      num_boost_round=2000,
+      valid_sets=[dval],
+      callbacks=[
+          lgb.early_stopping(100),
+          lgb.log_evaluation(50),
+      ],
+  )
+
+  # Guardar
+  model.save_model("models/lightgbm_v1.txt")
+
+  # Inferencia
+  y_pred_proba = model.predict(X_test)  # → array de probabilidades
+
+--- TUNING POSTERIOR ---
+
+  Se hara tuning con Optuna una vez que tengamos datos reales.
+  Parametros a tunear:
+    - num_leaves:         [31, 63, 127, 255]
+    - learning_rate:      [0.01, 0.03, 0.05, 0.1]
+    - min_child_samples:  [50, 100, 200, 500]
+    - reg_alpha:          [0, 0.01, 0.1, 1.0]
+    - reg_lambda:         [0, 0.1, 1.0, 5.0]
+    - subsample:          [0.6, 0.7, 0.8, 0.9]
+    - colsample_bytree:   [0.5, 0.6, 0.7, 0.8]
+
+================================================================================
+8. EVALUACION Y METRICAS
+================================================================================
+
+Metricas principales:
+  - Accuracy global (5 clases)
+  - Confusion matrix 5x5 (critico: ver donde se confunde)
+  - F1 score macro y por clase
+  - AUC-ROC one-vs-rest por clase (especialmente STRONG_UP y STRONG_DOWN)
+  - Calibracion por clase: cuando dice P(STRONG_UP)=0.4, pasa ~40%?
+
+Metricas por clase (lo que importa para operar):
+  - Precision de STRONG_UP: cuando predice STRONG_UP, cuantas veces acierta?
+  - Precision de STRONG_DOWN: idem
+  - Recall de STRONG: cuantos STRONG reales detecta?
+  - Tasa de confusion STRONG <-> opuesto (peor error: decir STRONG_UP y que
+    sea STRONG_DOWN o viceversa)
+  - % de samples donde clase predicha es FLAT (cobertura de "no operar")
+
+Rentabilidad simulada:
+  - Simular operaciones solo cuando P(STRONG_UP) o P(STRONG_DOWN) > threshold
+  - profit/loss por operacion (usando change_bps real)
+  - cantidad de operaciones por dia
+  - drawdown maximo
+  - Sharpe ratio
+  - Comparar vs operar con UP/DOWN moderados
+
+Validacion temporal:
+  - NUNCA random split
+  - Train en primeros 80% del tiempo, test en ultimo 20%
+  - Tambien: walk-forward validation (entrenar con N dias, testear dia N+1,
+    avanzar, repetir)
+
+================================================================================
+9. ESTRUCTURA DE ARCHIVOS
+================================================================================
+
+predictxgboost/
+  DESIGN.txt                        <- este archivo
+  requirements.txt                  <- dependencias Python
+  src/
+    capture/
+      websocket_capture.py          <- captura 24/7 de los 10 streams
+    data/
+      download_binance.py           <- descarga historica de Binance Data Vision
+    features/
+      feature_engine.py             <- calcula los ~213 features
+      normalizers.py                <- z-scores, ratios, normalizacion
+    training/
+      build_dataset.py              <- genera dataset de entrenamiento (1 sample/seg)
+      train_model.py                <- entrena LightGBM
+    inference/
+      live_predictor.py             <- prediccion en vivo cada 1 segundo
+      ring_buffers.py               <- buffers circulares de 120s para live
+    evaluation/
+      backtest.py                   <- backtesting con metricas de rentabilidad
+  data/
+    raw/                            <- datos capturados, particionados por dia
+      YYYY-MM-DD/
+        trades_spot/
+        trades_futures/
+        orderbook_spot/
+        orderbook_futures/
+        bookticker_spot/
+        bookticker_futures/
+        mark_price/
+        liquidations/
+        open_interest/
+        long_short/
+    dataset/
+      training_data.parquet         <- dataset generado
+  models/
+    lightgbm_v1.txt                 <- modelo entrenado (formato nativo LightGBM)
+    feature_columns.txt             <- lista ordenada de features
+
+================================================================================
+10. DEPENDENCIAS
+================================================================================
+
+  websockets>=12.0          websocket client
+  aiohttp>=3.9              REST polling
+  pyarrow>=15.0             parquet I/O
+  pandas>=2.2               DataFrames
+  numpy>=1.26               calculo numerico
+  lightgbm>=4.0             modelo (gradient boosted trees)
+  scikit-learn>=1.4         metricas, split
+  certifi                   SSL certificates macOS
+
+Opcionales (para tuning y analisis):
+  optuna                    hyperparameter tuning
+  matplotlib                graficos
+  shap                      explicabilidad de features
+
+================================================================================
+11. FLUJO DE USO
+================================================================================
+
+PASO 1: Obtener datos iniciales (elegir una opcion)
+
+  Opcion A - Descargar historico:
+    python -m src.data.download_binance --days 90
+
+  Opcion B - Capturar en vivo (dejar corriendo):
+    python -m src.capture.websocket_capture
+
+  Opcion C - Ambos: descargar historico + capturar en vivo para tener
+  datos frescos mientras acumulas.
+
+PASO 2: Generar dataset
+    python -m src.training.build_dataset
+
+PASO 3: Entrenar modelo
+    python -m src.training.train_model
+
+PASO 4: Correr en vivo
+    python -m src.inference.live_predictor
+
+PASO 5: Re-entrenar (cuando hay mas datos)
+    1. Parar live_predictor
+    2. python -m src.training.build_dataset
+    3. python -m src.training.train_model
+    4. Lanzar live_predictor de nuevo
+
+================================================================================
+12. MANEJO DE DESCONEXIONES Y CALIDAD DE DATOS
+================================================================================
+
+Los websockets se desconectan. Binance hace mantenimiento. Internet falla.
+Hay que detectar los huecos y decidir que hacer con los samples afectados.
+
+--- ESCENARIOS DE DESCONEXION ---
+
+  Caso 1: gap corto (<5 segundos)
+    ... datos ... | gap 3s | ... datos ...
+    No pasa nada. Los features de lookback 5s+ siguen teniendo datos
+    suficientes. Los de 1s y 3s ven menos trades, pero es lo mismo que
+    un momento de baja actividad. No requiere accion especial.
+
+  Caso 2: gap medio (5 - 60 segundos)
+    ... datos ... | gap 30s | ... datos ...
+    Los lookbacks cortos vuelven a funcionar al reconectar. Pero los
+    lookbacks largos (30s, 60s) ven una ventana con hueco: datos viejos
+    pre-gap + datos nuevos post-gap, sin el medio. Los features de
+    dinamica de book comparan "ahora vs hace 10s", pero si ese snapshot
+    de hace 10s cae en el gap, sale NaN o un valor incorrecto.
+    → SAMPLES CONTAMINADOS. Descartar.
+
+  Caso 3: gap largo (>60 segundos)
+    ... datos ... | gap 5 min | ... datos ...
+    Toda la ventana de 120s esta vacia o parcialmente vacia.
+    Features son basura completa.
+    → DESCARTAR.
+
+  Caso 4: un solo stream se cae (ej: orderbook, pero trades sigue)
+    Depende de que stream:
+    - Streams criticos (trades spot, trades futures, book spot, book futures):
+      → DESCARTAR el sample si falta cualquiera de estos.
+    - Streams secundarios (liquidaciones, mark_price, OI, long_short):
+      → Se puede mantener el sample con esos features en NaN.
+      LightGBM maneja NaN nativamente (los manda al hijo con mayor ganancia).
+
+--- SOLUCION: HEARTBEATS + VALIDACION ---
+
+  1. EN LA CAPTURA: Registro de heartbeats
+
+     Cada stream registra un "heartbeat" cada vez que recibe datos.
+     Se guarda en un archivo aparte:
+
+       data/raw/YYYY-MM-DD/heartbeats.parquet
+       ┌───────────────┬────────────────┬──────────┐
+       │ timestamp_ms  │ stream         │ status   │
+       ├───────────────┼────────────────┼──────────┤
+       │ 1741700000000 │ trades_spot    │ ok       │
+       │ 1741700000000 │ orderbook_spot │ ok       │
+       │ 1741700000000 │ trades_futures │ ok       │
+       │ 1741700001000 │ trades_spot    │ ok       │
+       │ 1741700001000 │ orderbook_spot │ ok       │
+       │ 1741700001000 │ trades_futures │ gap      │  ← no llego nada
+       │ ...           │ ...            │ ...      │
+       └───────────────┴────────────────┴──────────┘
+
+     Tambien se puede derivar post-hoc: si entre dos eventos consecutivos
+     de un stream hay >5 segundos de diferencia, hay un gap.
+
+  2. EN BUILD_DATASET: Validacion de cobertura por sample
+
+     Antes de calcular features para un segundo T, verificar:
+
+     STREAMS CRITICOS (si falta alguno, sample invalido):
+       - trades_spot:     ultimo trade < 5s ago?
+       - trades_futures:  ultimo trade < 5s ago?
+       - orderbook_spot:  ultimo snapshot < 2s ago?
+       - orderbook_futures: ultimo snapshot < 2s ago?
+
+     STREAMS SECUNDARIOS (si faltan, features = NaN pero sample valido):
+       - bookticker_spot/futures: si no hay, usar midprice de depth20
+       - mark_price: si no hay, funding_rate = NaN
+       - liquidations: si no hay, liq_* = 0 (es normal que no haya)
+       - open_interest: si no hay, oi_change = NaN
+       - long_short: si no hay, ratios = NaN
+
+     REGLA DE DESCARTE:
+
+       gap_trades_spot    = T - ultimo_trade_spot_ms
+       gap_trades_futures = T - ultimo_trade_futures_ms
+       gap_book_spot      = T - ultimo_snapshot_book_spot_ms
+       gap_book_futures    = T - ultimo_snapshot_book_futures_ms
+
+       max_gap_critico = max(gap_trades_spot, gap_trades_futures,
+                             gap_book_spot, gap_book_futures)
+
+       Si max_gap_critico > 5000 ms (5 segundos):
+         → SKIP este sample (no generar fila en el dataset)
+
+       Si max_gap_critico > 2000 ms (2 segundos):
+         → Generar sample pero marcarlo con data_quality = "degraded"
+
+       Si max_gap_critico <= 2000 ms:
+         → Sample normal, data_quality = "ok"
+
+     La columna data_quality se guarda en el dataset. Al entrenar se
+     puede filtrar: usar solo "ok", o incluir "degraded" tambien.
+
+  3. EN LIVE: Misma logica
+
+     El live_predictor aplica la misma validacion. Si detecta que un
+     stream critico tiene gap > 5s:
+       → No emite prediccion
+       → Muestra: "T=16:35:42 | NO SIGNAL (gap en orderbook_futures: 8s)"
+
+     Cuando el stream reconecta, espera a tener 5-10 segundos de datos
+     frescos antes de volver a emitir predicciones (warm-up).
+
+--- ESTADISTICAS DE CALIDAD ---
+
+  Al final de build_dataset, se reporta:
+
+    Total segundos procesados:    86,265
+    Samples generados (ok):       84,102  (97.5%)
+    Samples generados (degraded):  1,230  (1.4%)
+    Samples descartados (gap):       933  (1.1%)
+
+    Gaps detectados:
+      trades_spot:      3 gaps, max 45s, total 82s
+      trades_futures:   1 gap, max 12s, total 12s
+      orderbook_spot:   5 gaps, max 120s, total 340s
+      orderbook_futures: 2 gaps, max 30s, total 55s
+      mark_price:       0 gaps
+
+  Esto da visibilidad sobre la salud de la captura. Si un stream tiene
+  muchos gaps, hay que investigar (mala conexion, rate limiting, etc).
+
+================================================================================
+13. LIMITACIONES Y RIESGOS CONOCIDOS
+================================================================================
+
+  - Con pocos datos el modelo no aprende nada (accuracy ~50%).
+    Minimo recomendado: 7 dias de datos. Ideal: 30+ dias.
+
+  - Los datos historicos de Binance Data Vision NO tienen order book
+    a nivel de depth20 (solo tienen bookDepth agregado por porcentaje).
+    Los features de order book seran menos precisos cuando se entrena
+    con datos historicos vs datos capturados en vivo.
+    Alternativa: tardis.dev tiene order book de 25 niveles tick-by-tick,
+    bookTicker, liquidaciones, OI cada 30s, y datos de otros exchanges
+    (Coinbase, Bybit, OKX). Es la fuente mas completa para historicos.
+
+  - El mercado cambia de regimen. Un modelo entrenado en un mercado
+    bull puede no funcionar en un mercado bear. Re-entrenar regularmente.
+
+  - 15 segundos es un horizonte MUY corto. El edge (si existe) sera
+    pequeño. Necesitamos muchas predicciones con pequeño edge consistente,
+    no pocas predicciones con gran edge.
+
+  - Latencia de ejecucion: si el modelo dice UP pero tardamos 2 segundos
+    en actuar, el precio ya se movio. La ejecucion debe ser rapida.
+
+  - Overfitting: con ~213 features y millones de samples, LightGBM puede
+    overfittear patrones espurios. Validacion temporal estricta y
+    regularizacion agresiva son criticos.
+
+  - Desconexiones: ver seccion 12 para el manejo completo. En promedio
+    se espera perder 1-3% de los samples por gaps de conexion.
+
+================================================================================
