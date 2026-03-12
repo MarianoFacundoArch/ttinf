@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from pathlib import Path
+from scipy.stats import norm
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -733,6 +734,69 @@ def compute_data_quality(day, T_ms, open_ref_age_ms):
 
 
 # ---------------------------------------------------------------------------
+# GROUP G: Derived / pre-computed features (5 features)
+# Mathematical combinations that trees can't learn efficiently via splits.
+# ---------------------------------------------------------------------------
+
+def compute_derived(feats, ref, T_ms, block_start_ms):
+    """
+    Derived features computed from other features.
+    These are mathematical transformations that LightGBM trees
+    would need hundreds of splits to approximate.
+    """
+    f = {}
+    T_total = 300.0  # block duration in seconds
+    seconds_to_expiry = feats.get("seconds_to_expiry", 0.0)
+    t_elapsed = T_total - seconds_to_expiry
+    dist_bps = feats.get("dist_to_open_bps", 0.0)
+    z = feats.get("dist_to_open_z", 0.0)
+    sigma = feats.get("realized_vol_60s", 0.0)
+    if sigma <= 0:
+        sigma = feats.get("realized_vol_since_open", 0.0)
+
+    # 1. brownian_prob: Φ(z) — the Brownian baseline probability
+    f["brownian_prob"] = float(norm.cdf(np.clip(z, -10, 10)))
+
+    # 2. brownian_prob_drift: Φ(z_adjusted) — Brownian adjusted by recent drift
+    #    Uses return_30s as drift estimate over 30 seconds
+    mu_hat = feats.get("return_30s", 0.0) / 30.0  # bps per second
+    if sigma > 0 and seconds_to_expiry > 0:
+        drift_adjustment = mu_hat * seconds_to_expiry
+        z_drift = (dist_bps + drift_adjustment) / (sigma * np.sqrt(seconds_to_expiry))
+        f["brownian_prob_drift"] = float(norm.cdf(np.clip(z_drift, -10, 10)))
+    else:
+        f["brownian_prob_drift"] = f["brownian_prob"]
+
+    # 3. z_velocity: rate of change of z over last 5 seconds
+    #    Approximated from return_5s normalized by sigma and sqrt(time)
+    return_5s = feats.get("return_5s", 0.0)
+    if sigma > 0 and seconds_to_expiry > 0:
+        # z at T-5s ≈ (dist_bps - return_5s) / (sigma * sqrt(seconds_to_expiry + 5))
+        z_prev = (dist_bps - return_5s) / (sigma * np.sqrt(seconds_to_expiry + 5))
+        f["z_velocity"] = (z - z_prev) / 5.0
+    else:
+        f["z_velocity"] = 0.0
+
+    # 4. bridge_variance: σ² × t_elapsed × t_remaining / T_total
+    #    Peaks at mid-block, measures uncertainty independent of direction
+    if sigma > 0:
+        f["bridge_variance"] = sigma**2 * t_elapsed * seconds_to_expiry / T_total
+    else:
+        f["bridge_variance"] = 0.0
+
+    # 5. vol_ratio: realized_vol_since_open / realized_vol_60s
+    #    Detects volatility regime change within the block
+    vol_open = feats.get("realized_vol_since_open", 0.0)
+    vol_60 = feats.get("realized_vol_60s", 0.0)
+    if vol_60 > 0:
+        f["vol_ratio"] = vol_open / vol_60
+    else:
+        f["vol_ratio"] = 1.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # Feature column list (programmatically generated)
 # ---------------------------------------------------------------------------
 
@@ -806,6 +870,12 @@ def _build_feature_columns():
         "missing_stream_count", "open_ref_quality_flag", "core_streams_fresh_flag",
     ]
 
+    # Group G: Derived / pre-computed (5)
+    cols += [
+        "brownian_prob", "brownian_prob_drift", "z_velocity",
+        "bridge_variance", "vol_ratio",
+    ]
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -873,5 +943,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group F: Data quality
     feats.update(compute_data_quality(day, T_ms, open_ref_age_ms))
+
+    # Group G: Derived / pre-computed
+    feats.update(compute_derived(feats, ref, T_ms, block_start_ms))
 
     return feats

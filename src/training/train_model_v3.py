@@ -131,6 +131,10 @@ FEATURE_GROUPS = {
         "age_bookticker_ms", "age_markprice_ms", "age_depth_ms", "age_trades_ms",
         "missing_stream_count", "open_ref_quality_flag", "core_streams_fresh_flag",
     ],
+    "derived": [
+        "brownian_prob", "brownian_prob_drift", "z_velocity",
+        "bridge_variance", "vol_ratio",
+    ],
 }
 
 
