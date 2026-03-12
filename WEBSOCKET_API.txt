@@ -1,0 +1,155 @@
+WEBSOCKET API — BTC 5-Min Block Predictor
+==========================================
+
+Endpoint: ws://localhost:8765
+Protocol: WebSocket (no auth)
+Frequency: 1 message per second (configurable with --interval)
+
+
+HOW TO START THE SERVER
+-----------------------
+
+    python -u -m src.inference.live_runner
+    python -u -m src.inference.live_runner --interval 2 --ws-port 9000
+
+
+NODE.JS CLIENT EXAMPLE
+----------------------
+
+    const WebSocket = require('ws');
+    const ws = new WebSocket('ws://localhost:8765');
+
+    ws.on('message', (raw) => {
+      const pred = JSON.parse(raw);
+
+      // pred.p_up = model's probability that the 5-min block closes above open
+      // pred.p_down = 1 - p_up
+      // pred.ece_at_bucket = calibration error for current time bucket
+      // pred.accuracy_at_bucket = model accuracy for current time bucket
+
+      const polymarketPriceUp = getPolymarketPrice('UP');  // your code
+      const fee = 0.02;  // Polymarket fee - adjust to actual value
+
+      const edge = pred.p_up - polymarketPriceUp;
+      const minEdge = pred.ece_at_bucket + fee;
+
+      if (edge > minEdge && !pred.warming_up) {
+        // BUY UP — model says Up is more likely than Polymarket price implies
+      }
+
+      if (-edge > minEdge && !pred.warming_up) {
+        // BUY DOWN — model says Down is more likely than Polymarket price implies
+      }
+    });
+
+
+JSON PAYLOAD (every second)
+----------------------------
+
+{
+  "block_start_ms": 1773335100000,   // Block start timestamp (ms, UTC)
+  "now_ms": 1773335291000,           // Current timestamp (ms, UTC)
+  "seconds_to_expiry": 109.0,        // Seconds until block closes (300 = just started, 0 = closing)
+  "open_ref": 70384.30,              // Block open price (Binance index price at block start)
+  "price_now": 70429.13,             // Current Binance index price
+  "dist_to_open_bps": 6.37,          // How far price is from open in basis points (+/-)
+
+  "p_up": 0.7354,                    // MODEL PREDICTION: probability block closes above open (0.0 to 1.0)
+  "p_down": 0.2646,                  // 1 - p_up
+  "brownian_prob": 0.7742,           // Mathematical baseline (Brownian motion, no ML)
+  "edge_vs_brownian": -0.0388,       // p_up - brownian_prob (how much ML adds/subtracts vs pure math)
+
+  "accuracy_at_bucket": 0.8322,      // Model accuracy at current seconds_to_expiry (from walk-forward)
+  "ece_at_bucket": 0.0053,           // Calibration error at current bucket (lower = more reliable)
+
+  "direction": "UP",                 // "UP" if p_up >= 0.5, "DOWN" otherwise
+  "warming_up": false                // true = first block, no block history yet, predictions less reliable
+}
+
+
+FIELD DESCRIPTIONS
+------------------
+
+p_up
+  The core prediction. Probability (0 to 1) that the current 5-minute block
+  closes at or above the open price. This is what you compare against
+  Polymarket's price. If p_up = 0.73 and Polymarket sells UP at $0.65,
+  your edge is $0.08.
+
+p_down
+  Simply 1 - p_up. Convenience field.
+
+accuracy_at_bucket
+  Historical accuracy of the model at the current seconds_to_expiry, measured
+  across 8 walk-forward folds. Ranges from ~56% (near block start, 295-300s)
+  to ~97% (near block end, 5-10s). Use this to decide if you trust the
+  prediction enough to trade.
+
+ece_at_bucket
+  Expected Calibration Error for the current time bucket. This is how much
+  the model's predicted probabilities deviate from actual frequencies.
+  Lower = better calibrated. Ranges from 0.002 (near expiry) to 0.013
+  (near block start). Use this as the minimum edge threshold before fees.
+
+brownian_prob
+  What pure math says P(Up) is, based only on where price is vs open and
+  how much time is left. No machine learning. If p_up is close to
+  brownian_prob, the model isn't adding much — the prediction is mostly
+  "if it's above open, it'll probably stay above."
+
+edge_vs_brownian
+  p_up minus brownian_prob. Positive means the ML model is more bullish
+  than pure math. Negative means more bearish. Typically small (-0.05 to
+  +0.05). This tells you how much the model's prediction is driven by
+  trade flow, orderbook, funding rate, etc. vs just price position.
+
+warming_up
+  True during the first 5-minute block after server start. Block history
+  features (prev returns, streaks) are empty. Predictions work but are
+  less informed. Recommended: do not trade while warming_up is true.
+
+seconds_to_expiry
+  Seconds remaining in the current block. 300 = block just started,
+  0 = about to close. Key for your trading logic:
+    - 240-300s: model ~60% accurate, probably don't trade
+    - 150-240s: model ~70% accurate, trade only with large edge
+    - 60-150s: model ~83% accurate, best window for trading
+    - 0-60s: model ~90%+ accurate, but Polymarket price already reflects reality
+
+open_ref
+  The reference open price for the current block. This is the Binance index
+  price at the exact start of the 5-minute window. If price_now > open_ref,
+  "Up" is currently winning.
+
+dist_to_open_bps
+  (price_now - open_ref) / open_ref * 10000. Positive = price above open.
+  1 bps = 0.01%. Useful to gauge how far price has moved.
+
+
+BLOCK TIMING
+------------
+
+Blocks are 5-minute windows aligned to clock:
+  00:00-00:05, 00:05-00:10, 00:10-00:15, ... (UTC)
+
+The model predicts whether price_at_block_end >= price_at_block_start.
+
+New block starts → open_ref is set → predictions begin.
+Block ends → result is UP or DOWN → next block starts immediately.
+
+
+RELIABILITY NOTES
+-----------------
+
+1. The server reconnects automatically if Binance websockets drop.
+   During reconnection (~2 seconds), predictions continue with stale data.
+
+2. If the server restarts, the first block has warming_up=true.
+   Block history features are empty. Wait for the second block.
+
+3. The model was trained on Nov 2025 - Mar 2026 data. If market regime
+   changes significantly, accuracy may degrade. Monitor actual results
+   vs predicted probabilities.
+
+4. Predictions come every 1 second by default. All timestamps are UTC
+   milliseconds. Block boundaries are deterministic (floor to 300s).
