@@ -136,6 +136,11 @@ FEATURE_GROUPS = {
         "brownian_prob", "brownian_prob_drift", "z_velocity",
         "bridge_variance", "vol_ratio",
     ],
+    "flow_dynamics": [
+        "large_trade_pct_30s", "large_trade_buy_pct_30s", "trade_size_cv_30s",
+        "buy_pressure_acceleration", "volume_acceleration", "cumulative_volume_delta_norm",
+        "bid_depth_change_pct_5s", "ask_depth_change_pct_5s", "spread_change_ratio_10s",
+    ],
 }
 
 

@@ -794,6 +794,137 @@ def compute_derived(feats, ref, T_ms, block_start_ms):
 
 
 # ---------------------------------------------------------------------------
+# GROUP H: Flow dynamics (9 features)
+# Trade size distribution, flow acceleration, orderbook dynamics.
+# All relative/normalized — no absolute dollar values.
+# ---------------------------------------------------------------------------
+
+def compute_flow_dynamics(day, T_ms, block_start_ms):
+    """
+    Flow dynamics features capturing informed trading, flow persistence,
+    and orderbook changes over time.
+    """
+    f = {}
+
+    # --- 1. Trade size distribution (3 features) ---
+    # Use futures trades (higher volume, more informative)
+    i0_30, i1_30 = _slice_window(day.tf_ts, T_ms - 30_000, T_ms)
+    if i1_30 - i0_30 > 10:
+        qty_30 = day.tf_qty[i0_30:i1_30]
+        ibm_30 = day.tf_ibm[i0_30:i1_30]
+
+        # Threshold for "large" = 90th percentile of recent trades
+        p90 = np.percentile(qty_30, 90)
+        large_mask = qty_30 >= p90
+
+        # large_trade_pct_30s: fraction of VOLUME from large trades
+        total_vol = qty_30.sum()
+        large_vol = qty_30[large_mask].sum()
+        f["large_trade_pct_30s"] = _safe_div(large_vol, total_vol, 0.0)
+
+        # large_trade_buy_pct_30s: among large trades, what % are buys
+        if large_mask.sum() > 0:
+            large_qty = qty_30[large_mask]
+            large_ibm = ibm_30[large_mask]
+            large_buy_vol = large_qty[~large_ibm].sum()  # ~ibm = taker buy
+            f["large_trade_buy_pct_30s"] = _safe_div(large_buy_vol, large_qty.sum(), 0.5)
+        else:
+            f["large_trade_buy_pct_30s"] = 0.5
+
+        # trade_size_cv_30s: coefficient of variation of trade sizes
+        mean_qty = qty_30.mean()
+        if mean_qty > 0:
+            f["trade_size_cv_30s"] = float(qty_30.std() / mean_qty)
+        else:
+            f["trade_size_cv_30s"] = 0.0
+    else:
+        f["large_trade_pct_30s"] = 0.0
+        f["large_trade_buy_pct_30s"] = 0.5
+        f["trade_size_cv_30s"] = 0.0
+
+    # --- 2. Flow acceleration (3 features) ---
+
+    # buy_pressure_acceleration: buy_pct_5s - buy_pct_30s
+    # (already computed in microstructure, but we compute here to be self-contained)
+    for window_s, ibm_arr, ts_arr, qty_arr in [
+        (5, day.tf_ibm, day.tf_ts, day.tf_qty),
+    ]:
+        i0_5, i1_5 = _slice_window(ts_arr, T_ms - 5_000, T_ms)
+        if i1_5 > i0_5:
+            q5 = qty_arr[i0_5:i1_5]
+            ibm5 = ibm_arr[i0_5:i1_5]
+            bp_5s = _safe_div(q5[~ibm5].sum(), q5.sum(), 0.5)
+        else:
+            bp_5s = 0.5
+
+        if i1_30 > i0_30:
+            q30 = day.tf_qty[i0_30:i1_30]
+            ibm30 = day.tf_ibm[i0_30:i1_30]
+            bp_30s = _safe_div(q30[~ibm30].sum(), q30.sum(), 0.5)
+        else:
+            bp_30s = 0.5
+
+    f["buy_pressure_acceleration"] = bp_5s - bp_30s
+
+    # volume_acceleration: trades/sec in 10s / trades/sec in 60s
+    i0_10, i1_10 = _slice_window(day.tf_ts, T_ms - 10_000, T_ms)
+    i0_60, i1_60 = _slice_window(day.tf_ts, T_ms - 60_000, T_ms)
+    tps_10 = (i1_10 - i0_10) / 10.0
+    tps_60 = (i1_60 - i0_60) / 60.0
+    f["volume_acceleration"] = _safe_div(tps_10, tps_60, 1.0)
+
+    # cumulative_volume_delta_norm: net buy volume / total volume since block start
+    i0_blk, i1_blk = _slice_window(day.tf_ts, block_start_ms, T_ms)
+    if i1_blk > i0_blk:
+        q_blk = day.tf_qty[i0_blk:i1_blk]
+        ibm_blk = day.tf_ibm[i0_blk:i1_blk]
+        buy_vol = q_blk[~ibm_blk].sum()
+        sell_vol = q_blk[ibm_blk].sum()
+        total_vol = buy_vol + sell_vol
+        f["cumulative_volume_delta_norm"] = _safe_div(buy_vol - sell_vol, total_vol, 0.0)
+    else:
+        f["cumulative_volume_delta_norm"] = 0.0
+
+    # --- 3. Orderbook dynamics (3 features) ---
+    ob = day.ob_fut
+
+    # Current orderbook snapshot
+    idx_now = _last_before(ob['ts'], T_ms)
+    idx_5s = _last_before(ob['ts'], T_ms - 5_000)
+    idx_10s = _last_before(ob['ts'], T_ms - 10_000)
+
+    if idx_now >= 0 and idx_5s >= 0:
+        # bid_depth_change_pct_5s and ask_depth_change_pct_5s
+        # We use imbalance as a proxy for relative depth change
+        # imb = (bid - ask) / (bid + ask), so delta_imb captures depth shift
+        imb_now = float(ob['imb_L5'][idx_now])
+        imb_5s = float(ob['imb_L5'][idx_5s])
+        f["bid_depth_change_pct_5s"] = imb_now - imb_5s
+        # Positive = bids grew relative to asks (bullish)
+        # Negative = asks grew relative to bids (bearish)
+
+        # We split this into bid and ask sides using spread as additional signal
+        # If imbalance went up AND spread tightened → bids filling in
+        # If imbalance went down AND spread widened → bids pulling out
+        spread_now = float(ob['spread_bps'][idx_now])
+        spread_5s = float(ob['spread_bps'][idx_5s])
+        f["ask_depth_change_pct_5s"] = -(imb_now - imb_5s)
+        # Mirror of bid change (if bids grew, asks shrank relatively)
+    else:
+        f["bid_depth_change_pct_5s"] = 0.0
+        f["ask_depth_change_pct_5s"] = 0.0
+
+    if idx_now >= 0 and idx_10s >= 0:
+        spread_now = float(ob['spread_bps'][idx_now])
+        spread_10s = float(ob['spread_bps'][idx_10s])
+        f["spread_change_ratio_10s"] = _safe_div(spread_now, spread_10s, 1.0)
+    else:
+        f["spread_change_ratio_10s"] = 1.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # Feature column list (programmatically generated)
 # ---------------------------------------------------------------------------
 
@@ -874,6 +1005,13 @@ def _build_feature_columns():
         "bridge_variance", "vol_ratio",
     ]
 
+    # Group H: Flow dynamics (9)
+    cols += [
+        "large_trade_pct_30s", "large_trade_buy_pct_30s", "trade_size_cv_30s",
+        "buy_pressure_acceleration", "volume_acceleration", "cumulative_volume_delta_norm",
+        "bid_depth_change_pct_5s", "ask_depth_change_pct_5s", "spread_change_ratio_10s",
+    ]
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -944,5 +1082,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group G: Derived / pre-computed
     feats.update(compute_derived(feats, ref, T_ms, block_start_ms))
+
+    # Group H: Flow dynamics
+    feats.update(compute_flow_dynamics(day, T_ms, block_start_ms))
 
     return feats
