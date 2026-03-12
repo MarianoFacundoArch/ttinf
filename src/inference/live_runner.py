@@ -172,9 +172,9 @@ async def warmup(buffer, session):
     except Exception as e:
         print(f"  openInterest: ERROR {e}")
 
-    # 5. Recent trades futures (last 60s)
+    # 5. Recent trades futures (last 120s — needed for VPIN_120s)
     try:
-        start_ms = now_ms - 60_000
+        start_ms = now_ms - 120_000
         url = (f"{FUTURES_REST}/fapi/v1/aggTrades?symbol=BTCUSDT"
                f"&startTime={start_ms}&endTime={now_ms}&limit=1000")
         async with session.get(url, ssl=SSL_CONTEXT) as r:
@@ -183,13 +183,13 @@ async def warmup(buffer, session):
                 buffer.add_trade_futures(
                     int(t["T"]), float(t["p"]), float(t["q"]), bool(t["m"])
                 )
-            print(f"  trades_futures: {len(data)} trades (last 60s)")
+            print(f"  trades_futures: {len(data)} trades (last 120s)")
     except Exception as e:
         print(f"  trades_futures: ERROR {e}")
 
-    # 6. Recent trades spot (last 60s)
+    # 6. Recent trades spot (last 120s)
     try:
-        start_ms = now_ms - 60_000
+        start_ms = now_ms - 120_000
         url = (f"{SPOT_REST}/api/v3/aggTrades?symbol=BTCUSDT"
                f"&startTime={start_ms}&endTime={now_ms}&limit=1000")
         async with session.get(url, ssl=SSL_CONTEXT) as r:
@@ -198,7 +198,7 @@ async def warmup(buffer, session):
                 buffer.add_trade_spot(
                     int(t["T"]), float(t["p"]), float(t["q"]), bool(t["m"])
                 )
-            print(f"  trades_spot: {len(data)} trades (last 60s)")
+            print(f"  trades_spot: {len(data)} trades (last 120s)")
     except Exception as e:
         print(f"  trades_spot: ERROR {e}")
 
