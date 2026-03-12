@@ -1,0 +1,225 @@
+============================================================================
+  TOP 30 FEATURES DEL MODELO V3 — EXPLICADO PARA HUMANOS
+============================================================================
+
+El modelo predice si un bloque de 5 minutos de BTC cierra arriba o abajo
+de su precio de apertura. Usa 91 variables (features) pero las 30 más
+importantes son estas. El número entre paréntesis es cuánto usa esa
+variable el modelo (% de importancia).
+
+
+--- GRUPO 1: ¿DÓNDE ESTÁ EL PRECIO VS LA APERTURA? ---
+   (Las más importantes — el modelo se fija primero en esto)
+
+ 1. dist_to_open_bps (7.0%)
+    "¿Cuánto se movió el precio desde que abrió el bloque?"
+    Medido en basis points (1 bps = 0.01%). Si es +5, el precio subió
+    0.05% desde la apertura. Si es -3, bajó 0.03%.
+    Lógica: si el precio está arriba del open, probablemente cierre arriba.
+
+ 5. dist_to_open_z (4.8%)
+    "¿Cuánto se movió, pero ajustado por la volatilidad y el tiempo?"
+    Es la misma distancia al open, pero normalizada. Un +5 bps con mucha
+    volatilidad es "meh", pero +5 bps con poca volatilidad es "mucho".
+    Lógica: mide si la distancia es significativa dado el contexto.
+
+ 4. brownian_prob (5.0%)
+    "¿Qué probabilidad da la matemática pura de que cierre arriba?"
+    Es la fórmula del movimiento Browniano aplicada a dist_to_open_z.
+    Da un número entre 0 y 1. Ej: 0.72 = 72% chance de cerrar arriba.
+    Lógica: le da al modelo la "respuesta de la física" como punto de
+    partida, y el modelo ajusta desde ahí.
+
+19. range_since_open_bps (2.1%)
+    "¿Cuánto varió el precio desde que abrió el bloque?"
+    Es la diferencia entre el máximo y el mínimo del bloque hasta ahora.
+    Si el rango es 20 bps, el precio se movió bastante. Si es 2, poco.
+    Lógica: un rango grande = bloque volátil, puede pasar cualquier cosa.
+
+26. max_runup_since_open_bps (1.6%)
+    "¿Cuál fue el pico más alto que tocó desde la apertura?"
+    Si abrió en 100,000 y llegó a 100,050, el runup es +5 bps.
+    Lógica: si el precio ya tocó un máximo alto y ahora bajó, puede
+    estar perdiendo fuerza.
+
+29. max_drawdown_since_open_bps (1.4%)
+    "¿Cuál fue el piso más bajo que tocó desde la apertura?"
+    El opuesto del anterior. Si cayó a 99,950, el drawdown es -5 bps.
+    Lógica: si ya tocó un mínimo profundo y se recuperó, puede tener
+    fuerza para cerrar arriba.
+
+
+--- GRUPO 2: ¿CUÁNTO TIEMPO QUEDA? ---
+
+ 2. seconds_to_expiry (5.4%)
+    "¿Cuántos segundos faltan para que cierre el bloque?"
+    Va de 300 (acaba de abrir) a 0 (está por cerrar).
+    Lógica: con mucho tiempo todo puede pasar. Con poco tiempo, lo que
+    ves es lo que hay. El modelo predice con más confianza al final.
+
+
+--- GRUPO 3: ¿EL MERCADO ESTÁ TRANQUILO O AGITADO? ---
+
+ 3. vol_ratio (5.3%)
+    "¿La volatilidad del bloque es mayor o menor que la del último minuto?"
+    Si es > 1, el bloque es más volátil que lo normal reciente.
+    Si es < 1, está más tranquilo.
+    Lógica: un cambio de régimen de volatilidad afecta cuánto confiar
+    en la posición actual. Más vol = más incertidumbre.
+
+11. prev_15m_realized_vol (2.5%)
+    "¿Qué tan volátil estuvo el mercado en los últimos 15 minutos?"
+    Volatilidad reciente en basis points por segundo.
+    Lógica: si los últimos 15 min fueron muy volátiles, este bloque
+    probablemente también lo sea.
+
+21. realized_vol_60s (1.8%)
+    "¿Qué tan volátil estuvo el último minuto?"
+    Igual que el anterior pero ventana más corta (60 segundos).
+    Lógica: volatilidad inmediata. Si aceleró, hay movimiento fuerte.
+
+
+--- GRUPO 4: ¿QUÉ PASÓ EN BLOQUES ANTERIORES? ---
+   (El modelo busca momentum o reversión a la media)
+
+ 6. mean_return_last_6 (4.7%)
+    "¿Cuánto subió o bajó en promedio en los últimos 6 bloques (30 min)?"
+    Si es positivo, la tendencia reciente es alcista. Si negativo, bajista.
+    Lógica: momentum — si los últimos bloques subieron, el próximo
+    puede seguir subiendo. O si exageró, puede revertir.
+
+ 7. prev_3_return_bps (3.6%)
+    "¿Cuánto movió el bloque de hace 3 (15 minutos atrás)?"
+    El retorno del bloque específico 3 bloques atrás.
+    Lógica: patrones de 15 minutos — ¿hubo un movimiento fuerte
+    hace 15 min que todavía tiene efecto?
+
+ 8. vol_last_6 (3.5%)
+    "¿Qué tan variables fueron los retornos de los últimos 6 bloques?"
+    Si es alta, los bloques recientes tuvieron resultados dispares.
+    Si es baja, fueron consistentes.
+    Lógica: mercado errático vs mercado con tendencia clara.
+
+ 9. max_abs_return_last_6 (3.2%)
+    "¿Cuál fue el movimiento más grande en los últimos 6 bloques?"
+    El bloque que más se movió (en valor absoluto) en la última media hora.
+    Lógica: detecta si hubo un "evento" reciente (flash crash, pump, etc.)
+
+10. prev_1_return_bps (3.0%)
+    "¿Cuánto subió o bajó el bloque anterior (hace 5 min)?"
+    El retorno del bloque inmediatamente anterior.
+    Lógica: ¿hay momentum directo? ¿El último bloque fue UP fuerte?
+
+12. prev_2_return_bps (2.5%)
+    "¿Cuánto movió el bloque de hace 2 (10 minutos atrás)?"
+    Similar a prev_1 y prev_3 pero para el bloque de hace 10 min.
+
+
+--- GRUPO 5: ¿QUÉ DICEN LOS TRADERS? ---
+   (Presión compradora/vendedora y posicionamiento)
+
+13. spot_imbalance_L5 (2.3%)
+    "En el libro de órdenes spot, ¿hay más compradores o vendedores?"
+    Mira las 5 mejores ofertas de compra vs venta. Si es positivo,
+    hay más volumen queriendo comprar. Si negativo, más vendedores.
+    Lógica: más compradores esperando = soporte para el precio.
+
+14. long_short_change (2.2%)
+    "¿Los traders están cambiando de posición?"
+    Cambio en el ratio long/short vs la medición anterior.
+    Si sube, más gente se está poniendo long (apuesta a que sube).
+    Lógica: movimiento de posicionamiento indica expectativas.
+
+22. spot_imbalance_L1 (1.8%)
+    "¿En el mejor precio de compra/venta, quién tiene más volumen?"
+    Solo mira el nivel 1 (la mejor oferta). Más granular que L5.
+    Lógica: presión inmediata de compra o venta.
+
+23. taker_long_short_vol_ratio (1.8%)
+    "¿Los que ejecutan órdenes agresivas están comprando o vendiendo?"
+    Ratio de volumen de takers que compran vs los que venden.
+    Lógica: los takers son agresivos — su dirección puede anticipar
+    movimientos.
+
+27. fut_imbalance_L5 (1.5%)
+    "Igual que spot_imbalance_L5 pero en el mercado de futuros."
+    Presión de compra/venta en futuros.
+
+28. oi_change_pct_5m (1.5%)
+    "¿Cambió el Open Interest en los últimos 5 minutos?"
+    Open Interest = total de contratos de futuros abiertos.
+    Si sube, entra dinero nuevo al mercado. Si baja, sale.
+    Lógica: OI subiendo + precio subiendo = tendencia fuerte.
+    OI bajendo + precio subiendo = short squeeze (menos confiable).
+
+30. fut_imbalance_L1 (1.3%)
+    "Presión compra/venta en futuros, solo mejor precio."
+    Igual que spot L1 pero en futuros.
+
+
+--- GRUPO 6: ¿QUÉ MOMENTO DEL DÍA / SEMANA ES? ---
+
+15. minutes_to_funding (2.2%)
+    "¿Cuánto falta para el próximo pago de funding?"
+    Funding se paga cada 8 horas en Binance. Cerca del pago, los
+    traders ajustan posiciones, lo que puede mover el precio.
+    Lógica: los 30-60 min antes del funding suelen tener patrones
+    predecibles (ej: si funding es positivo, los longs pagan, y
+    algunos cierran antes para evitar el pago).
+
+17. funding_rate (2.1%)
+    "¿Cuánto están pagando los longs a los shorts (o viceversa)?"
+    Positivo = longs pagan (mercado bullish pero tiene costo).
+    Negativo = shorts pagan (mercado bearish con costo).
+    Lógica: funding alto positivo = mercado sobrecomprado,
+    puede corregir. Funding negativo extremo = puede rebotar.
+
+18. spot_spread_bps (2.1%)
+    "¿Cuánta diferencia hay entre el mejor precio de compra y venta?"
+    Spread chico = mercado líquido, normal. Spread grande = poca
+    liquidez, puede haber movimientos bruscos.
+    Lógica: indicador de "salud" del mercado en ese momento.
+
+20. hour_sin (2.0%)
+24. hour_cos (1.7%)
+    "¿Qué hora del día es?" (codificado como par seno/coseno)
+    Juntos representan la hora exacta UTC.
+    Lógica: BTC se mueve distinto a las 3 AM (Asia opera, EEUU
+    duerme) que a las 3 PM (Wall Street activa). El modelo
+    aprende estos patrones horarios.
+
+25. minute_of_day (1.7%)
+    "¿Qué minuto exacto del día es?" (0 a 1439)
+    Más preciso que solo la hora. Captura que 11:55 es diferente
+    de 11:20 (ej: cerca del cierre de mercados, pre-news, etc.)
+    Lógica: ciertos minutos tienen patrones específicos por
+    publicación de datos económicos o cruces de mercados.
+
+
+--- GRUPO 7: ¿CÓMO SE MUEVE EL Z-SCORE? ---
+
+16. z_velocity (2.1%)
+    "¿El z-score está subiendo o bajando?"
+    Si z es "dónde estás", z_velocity es "hacia dónde vas".
+    Positivo = el z-score sube (la probabilidad de Up crece).
+    Negativo = el z-score baja (la probabilidad de Up cae).
+    Lógica: no es lo mismo estar en z=1.0 subiendo que en z=1.0
+    bajando. El primero tiene momentum, el segundo se está frenando.
+
+
+============================================================================
+  RESUMEN POR GRUPOS DE IMPORTANCIA
+============================================================================
+
+  Posición vs apertura (features 1,4,5,19,26,29):     ~22%
+  Historial de bloques (features 6,7,8,9,10,12):       ~21%
+  Volatilidad y régimen (features 3,11,21):             ~10%
+  Tiempo y contexto (features 2,15,17,20,24,25):        ~15%
+  Microestructura/orderbook (features 13,14,18,22,23,27,28,30): ~14%
+  Derivados matemáticos (features 4,16):                ~7%
+
+  El modelo dice: "Primero miro dónde está el precio vs la apertura.
+  Después miro qué pasó en bloques recientes. Después miro cuánto
+  tiempo queda y si la volatilidad cambió. Y finalmente ajusto con
+  lo que dicen el orderbook y el posicionamiento de traders."
+============================================================================

@@ -357,6 +357,40 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
         print(f"     {label:<22s} {mask.sum():>8,} {acc_m:>8.4f} {ll_m:>10.6f} {auc_m:>8.4f} {acc_m - bm_acc:>+10.4f}")
         phase_results[label] = {"accuracy": acc_m, "logloss": ll_m, "auc": auc_m, "vs_bm_acc": acc_m - bm_acc}
 
+    # --- 3b. Fine-grained accuracy (10s buckets) ---
+    print(f"\n  3b. FINE-GRAINED ACCURACY (10s buckets)")
+    print(f"     {'Bucket':<12s} {'Rows':>8s} {'Acc':>8s} {'BM_Acc':>8s} {'vs_BM':>8s} {'ECE':>8s} {'AvgP':>8s} {'FreqUp':>8s}")
+    fine_results = {}
+    y_cal_fine = apply_calibrators(y_proba, seconds, calibrators) if calibrators else y_proba
+    for lo in range(0, 300, 10):
+        hi = lo + 10
+        label = f"{lo}-{hi}s"
+        mask = (seconds >= lo) & (seconds < hi)
+        if mask.sum() < 10:
+            continue
+        y_m = y[mask]
+        p_m = y_cal_fine[mask]
+        pred_m = (p_m >= 0.5).astype(int)
+        acc_m = accuracy_score(y_m, pred_m)
+
+        # BM baseline
+        bm_p = baseline_brownian(dist_bps[mask], vol[mask], seconds[mask])
+        bm_pred = (bm_p >= 0.5).astype(int)
+        bm_acc = accuracy_score(y_m, bm_pred)
+
+        # ECE for this bucket
+        avg_p = float(p_m.mean())
+        freq_up = float(y_m.mean())
+        ece_bucket = abs(avg_p - freq_up)
+
+        print(f"     {label:<12s} {mask.sum():>8,} {acc_m:>8.4f} {bm_acc:>8.4f} {acc_m - bm_acc:>+8.4f} {ece_bucket:>8.4f} {avg_p:>8.4f} {freq_up:>8.4f}")
+        fine_results[label] = {
+            "accuracy": acc_m, "bm_accuracy": bm_acc,
+            "vs_bm": acc_m - bm_acc, "ece": ece_bucket,
+            "avg_pred": avg_p, "freq_up": freq_up, "rows": int(mask.sum()),
+        }
+    phase_results["_fine"] = fine_results
+
     # --- 4. Calibration ---
     print(f"\n  4. CALIBRATION")
     y_cal = apply_calibrators(y_proba, seconds, calibrators) if calibrators else y_proba
@@ -637,6 +671,27 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
             if accs:
                 print(f"  {label:<25s} {np.mean(accs):>8.4f} {np.mean(aucs):>8.4f} "
                       f"{np.mean(vs_bm):>+8.4f} {np.std(accs):>8.4f}")
+
+        # Fine-grained summary (10s buckets)
+        print(f"\n  FINE-GRAINED ACCURACY (10s buckets, averaged across {len(all_results)} folds)")
+        print(f"  {'Bucket':<12s} {'Acc':>8s} {'BM_Acc':>8s} {'vs_BM':>8s} {'ECE':>8s} {'Rows':>10s}")
+        for lo in range(0, 300, 10):
+            label = f"{lo}-{lo+10}s"
+            accs = [r["phase_results"]["_fine"][label]["accuracy"]
+                    for r in all_results
+                    if "_fine" in r.get("phase_results", {}) and label in r["phase_results"]["_fine"]]
+            bm_accs = [r["phase_results"]["_fine"][label]["bm_accuracy"]
+                       for r in all_results
+                       if "_fine" in r.get("phase_results", {}) and label in r["phase_results"]["_fine"]]
+            eces = [r["phase_results"]["_fine"][label]["ece"]
+                    for r in all_results
+                    if "_fine" in r.get("phase_results", {}) and label in r["phase_results"]["_fine"]]
+            rows = [r["phase_results"]["_fine"][label]["rows"]
+                    for r in all_results
+                    if "_fine" in r.get("phase_results", {}) and label in r["phase_results"]["_fine"]]
+            if accs:
+                print(f"  {label:<12s} {np.mean(accs):>8.4f} {np.mean(bm_accs):>8.4f} "
+                      f"{np.mean(accs) - np.mean(bm_accs):>+8.4f} {np.mean(eces):>8.4f} {int(np.mean(rows)):>10,}")
 
     return all_results
 

@@ -235,13 +235,11 @@ def build_ref_price(day):
     last_s  = (last_ms // 1000) * 1000
 
     grid_ts = np.arange(first_s, last_s + 1000, 1000, dtype=np.int64)
+    # Vectorized forward-fill: for each grid point, use last index_price <= that time
+    indices = np.searchsorted(day.mp_ts, grid_ts, side='right') - 1
+    valid = indices >= 0
     grid_price = np.full(len(grid_ts), np.nan, dtype=np.float64)
-
-    # Forward-fill: for each grid point, use last index_price <= that time
-    for i, t in enumerate(grid_ts):
-        idx = _last_before(day.mp_ts, t)
-        if idx >= 0:
-            grid_price[i] = prices[idx]
+    grid_price[valid] = prices[indices[valid]]
 
     return {'ts': grid_ts, 'price': grid_price}
 
@@ -499,7 +497,8 @@ def compute_microstructure(day, ref, T_ms):
     if ref_idx >= 0 and len(ref['ts']) > 0:
         # Block drift (bps/s since open)
         elapsed_s = max(1, (T_ms - block_start_approx) / 1000.0)
-        block_drift = f.get("_dist_to_open_bps_temp", _safe_div(ref_now - ref['price'][max(0, np.searchsorted(ref['ts'], block_start_approx, side='left'))], ref_now) * 10_000) / elapsed_s
+        bs_idx = min(np.searchsorted(ref['ts'], block_start_approx, side='left'), len(ref['ts']) - 1)
+        block_drift = f.get("_dist_to_open_bps_temp", _safe_div(ref_now - ref['price'][max(0, bs_idx)], ref_now) * 10_000) / elapsed_s
 
         # Recent drift (bps/s over 30s)
         ref_30_idx = _last_before(ref['ts'], T_ms - 30_000)
