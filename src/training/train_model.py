@@ -56,13 +56,14 @@ PARAMS = {
     "reg_alpha":        0.1,
     "reg_lambda":       1.0,
     "max_bin":          255,
+    "is_unbalance":     True,
     "verbose":          -1,
     "seed":             42,
     "num_threads":      -1,
 }
 
-NUM_BOOST_ROUND = 2000
-EARLY_STOPPING  = 100
+NUM_BOOST_ROUND = 5000
+EARLY_STOPPING  = 200
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +322,7 @@ def save_model(model, results, output_dir=None):
     d.mkdir(parents=True, exist_ok=True)
 
     # Model (native LightGBM format)
-    model_path = d / "lightgbm_v1.txt"
+    model_path = d / "lightgbm_v2.txt"
     model.save_model(str(model_path))
     print(f"\nModel saved: {model_path}")
 
