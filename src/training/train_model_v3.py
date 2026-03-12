@@ -51,7 +51,7 @@ PARAMS = {
     "metric":           "binary_logloss",
     "boosting_type":    "gbdt",
     "num_leaves":       63,
-    "learning_rate":    0.03,
+    "learning_rate":    0.01,
     "subsample":        0.8,
     "subsample_freq":   1,
     "colsample_bytree": 0.7,
@@ -65,7 +65,7 @@ PARAMS = {
 }
 
 NUM_BOOST_ROUND = 3000
-EARLY_STOPPING  = 200
+EARLY_STOPPING  = 500
 
 # Time buckets for calibration and phase analysis
 TIME_BUCKETS = [
