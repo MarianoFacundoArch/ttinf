@@ -126,15 +126,15 @@ FEATURE_GROUPS = {
     ],
     "temporal": [
         "hour_sin", "hour_cos", "dow_sin", "dow_cos", "is_us_market_hours",
+        "minute_of_day", "day_of_week",
     ],
     "data_quality": [
         "age_bookticker_ms", "age_markprice_ms", "age_depth_ms", "age_trades_ms",
         "missing_stream_count", "open_ref_quality_flag", "core_streams_fresh_flag",
     ],
     "derived": [
-        "brownian_prob", "brownian_prob_drift_30", "brownian_prob_drift_10",
-        "z_velocity", "z_acceleration", "remaining_sigma",
-        "vol_ratio", "persistence_delta", "flow_alignment",
+        "brownian_prob", "brownian_prob_drift", "z_velocity",
+        "bridge_variance", "vol_ratio",
     ],
 }
 
