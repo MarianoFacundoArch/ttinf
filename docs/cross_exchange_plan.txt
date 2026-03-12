@@ -1,0 +1,71 @@
+PLAN: Cross-Exchange Data (Coinbase + Bybit)
+=============================================
+
+ESTADO ACTUAL: Paso 1 en progreso (descargando datos)
+
+PASO 1: Descargar datos historicos de Coinbase + Bybit [EN PROGRESO]
+  - Comando: python -m src.data.download_all --start 2025-11-11 --end 2026-03-11 --cross-only --workers 4
+  - 6 streams: cb_quotes, cb_trades, cb_book_l2, bb_quotes, bb_trades, bb_book25
+  - Se guarda en data/raw/YYYY-MM-DD/coinbase_*/ y bybit_*/
+
+PASO 2: Actualizar feature_engine_v3.py
+  - Agregar campos cross-exchange a DayData (cb_ts, cb_bid, cb_ask, cb_trades, bb_*)
+  - Actualizar load_day_data() para cargar los nuevos parquets
+  - Crear compute_cross_exchange_features()
+  - Ronda 1 (6 features, solo quotes):
+      cb_spread_bps           - spread de Coinbase
+      bb_spread_bps           - spread de Bybit
+      cb_vs_binance_bps       - Coinbase precio vs Binance
+      bb_vs_binance_bps       - Bybit precio vs Binance
+      cross_mean_vs_binance   - promedio de todos vs Binance
+      cross_price_std_bps     - desviacion entre exchanges
+  - Ronda 2 (4 features, + trades):
+      cb_buy_pct_30s          - flujo comprador Coinbase
+      bb_buy_pct_30s          - flujo comprador Bybit
+      cb_leads_binance_5s     - lead-lag Coinbase vs Binance
+      volume_share_binance    - % volumen en Binance vs total
+  - Ronda 3 (4+ features, + depth):
+      cb_imbalance_L5         - imbalance libro Coinbase
+      bb_imbalance_L5         - imbalance libro Bybit
+      cb_ob_near_open         - volume near open en Coinbase (traducido)
+      bb_ob_near_open         - volume near open en Bybit (traducido)
+
+PASO 3: Actualizar build_dataset_v3.py
+  - Merge de datos cross-exchange en _merge_day_data()
+  - Las features nuevas se calculan automaticamente
+
+PASO 4: Reconstruir dataset
+  - python -m src.training.build_dataset_v3 --start 2025-11-11 --end 2026-03-11 --workers 8
+
+PASO 5: Entrenar walk-forward y comparar
+  - python -m src.training.train_model_v3 --walkforward
+
+PASO 6: Evaluar resultados - comparar con baseline (LR=0.01):
+  - accuracy: 0.7624
+  - delta_vs_bm_acc: +0.0025
+  - confidence low (0.45-0.55): +0.0034
+  - 0-30s directional: 62.9%, 8/8 folds
+  - best_iteration: 451
+  Preguntas clave:
+  - Mejoro accuracy? delta_vs_bm_acc?
+  - Mejoro en casos dudosos (confianza 0.45-0.55)?
+  - Mejoro en ultimos 60s?
+  - Las features nuevas entraron al top 30?
+
+PASO 7: Si Ronda 1 suma -> Ronda 2 (trades) -> Ronda 3 (depth)
+  - Cada ronda: agregar features, rebuild dataset, train, comparar
+
+PASO 8: Actualizar live inference
+  - Agregar websockets de Coinbase y Bybit a live_runner.py
+  - Coinbase: canal "ticker" (quotes) + "matches" (trades) - gratis
+  - Bybit: canal "tickers" (quotes) + "publicTrade" (trades) - gratis
+  - Actualizar live_buffer.py con campos cross-exchange
+  - Actualizar live_predictor.py (ya lee features del modelo)
+
+HYPERPARAMETROS ACTUALES:
+  - learning_rate: 0.01
+  - early_stopping: 500
+  - num_boost_round: 3000
+  - Pendiente: probar LR=0.005 despues de agregar datos
+
+NOTA: al agregar todos los datos, tunear hyperparametros de nuevo
