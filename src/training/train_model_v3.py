@@ -77,14 +77,18 @@ TIME_BUCKETS = [
     (0,    30, "0-30s (late)"),
 ]
 
-# Phase buckets for reporting (6 phases, 50s each)
+# Phase buckets for reporting (10 phases, 30s each)
 PHASE_BUCKETS = [
-    (250, 300, "very_early (250-300s)"),
-    (200, 250, "early (200-250s)"),
-    (150, 200, "mid_early (150-200s)"),
-    (100, 150, "mid_late (100-150s)"),
-    (50,  100, "late (50-100s)"),
-    (0,    50, "very_late (0-50s)"),
+    (270, 300, "270-300s"),
+    (240, 270, "240-270s"),
+    (210, 240, "210-240s"),
+    (180, 210, "180-210s"),
+    (150, 180, "150-180s"),
+    (120, 150, "120-150s"),
+    (90,  120, "90-120s"),
+    (60,   90, "60-90s"),
+    (30,   60, "30-60s"),
+    (0,    30, "0-30s"),
 ]
 
 # Feature groups for importance aggregation
