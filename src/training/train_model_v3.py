@@ -709,6 +709,47 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
         disagree_results["by_time_bucket"] = time_bucket_disagree
 
         result["disagreement"] = disagree_results
+
+        # --- Calibration quality per time bucket ---
+        calib_quality = {}
+        for lo, hi, label in TIME_BUCKETS:
+            t_mask = (test_seconds >= lo) & (test_seconds < hi)
+            if t_mask.sum() < 50:
+                continue
+            y_t = y_test[t_mask]
+            p_model = y_cal_test[t_mask]
+            p_bm = bm_proba[t_mask]
+
+            # Brier scores
+            brier_model = float(brier_score_loss(y_t, p_model))
+            brier_bm = float(brier_score_loss(y_t, p_bm))
+
+            # Calibration by predicted probability within this time bucket
+            prob_bins = {}
+            for p_lo, p_hi in [(0.0, 0.3), (0.3, 0.4), (0.4, 0.45), (0.45, 0.5),
+                                (0.5, 0.55), (0.55, 0.6), (0.6, 0.7), (0.7, 1.0)]:
+                p_mask = (p_model >= p_lo) & (p_model < p_hi)
+                n_bin = p_mask.sum()
+                if n_bin < 10:
+                    continue
+                actual_freq = float(y_t[p_mask].mean())
+                predicted_avg = float(p_model[p_mask].mean())
+                prob_bins[f"{p_lo:.2f}-{p_hi:.2f}"] = {
+                    "n": int(n_bin),
+                    "predicted": predicted_avg,
+                    "actual": actual_freq,
+                    "error": abs(predicted_avg - actual_freq),
+                }
+
+            calib_quality[label] = {
+                "brier_model": brier_model,
+                "brier_bm": brier_bm,
+                "brier_diff": brier_bm - brier_model,
+                "n": int(t_mask.sum()),
+                "prob_bins": prob_bins,
+            }
+        result["calib_quality"] = calib_quality
+
         all_results.append(result)
 
         start += step_days
@@ -823,6 +864,48 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
                 avg_mr = np.mean(mrs)
                 verdict = "MODEL" if avg_mr > 0.52 else ("BROWNIAN" if avg_mr < 0.48 else "TIE")
                 print(f"     {label:<22s} {int(np.mean(ns)):>8,} {avg_mr:>13.1%} {verdict:>10s}")
+
+        # D) Calibration quality per time bucket
+        print(f"\n  CALIBRATION QUALITY BY TIME BUCKET (averaged across {len(all_results)} folds)")
+        print(f"  {'Bucket':<22s} {'N':>8s} {'Brier_Model':>12s} {'Brier_BM':>10s} {'Better?':>10s}")
+        for _, _, label in TIME_BUCKETS:
+            briers_m = [r["calib_quality"][label]["brier_model"]
+                        for r in all_results if label in r.get("calib_quality", {})]
+            briers_bm = [r["calib_quality"][label]["brier_bm"]
+                         for r in all_results if label in r.get("calib_quality", {})]
+            ns = [r["calib_quality"][label]["n"]
+                  for r in all_results if label in r.get("calib_quality", {})]
+            if briers_m:
+                bm = np.mean(briers_m)
+                bb = np.mean(briers_bm)
+                better = "MODEL" if bm < bb else "BM"
+                print(f"  {label:<22s} {int(np.mean(ns)):>8,} {bm:>12.6f} {bb:>10.6f} {better:>10s}")
+
+        # Detailed: predicted vs actual frequency per time bucket
+        print(f"\n  PREDICTED vs ACTUAL FREQUENCY BY TIME BUCKET")
+        for _, _, label in TIME_BUCKETS:
+            bins_all = {}
+            for r in all_results:
+                if label not in r.get("calib_quality", {}):
+                    continue
+                for bin_key, bin_data in r["calib_quality"][label]["prob_bins"].items():
+                    if bin_key not in bins_all:
+                        bins_all[bin_key] = {"predicted": [], "actual": [], "n": []}
+                    bins_all[bin_key]["predicted"].append(bin_data["predicted"])
+                    bins_all[bin_key]["actual"].append(bin_data["actual"])
+                    bins_all[bin_key]["n"].append(bin_data["n"])
+            if not bins_all:
+                continue
+            print(f"\n  {label}:")
+            print(f"    {'P(pred)':<14s} {'N':>8s} {'Predicted':>10s} {'Actual':>10s} {'Error':>10s} {'Status':>8s}")
+            for bin_key in sorted(bins_all.keys()):
+                bd = bins_all[bin_key]
+                avg_pred = np.mean(bd["predicted"])
+                avg_actual = np.mean(bd["actual"])
+                avg_n = int(np.mean(bd["n"]))
+                error = abs(avg_pred - avg_actual)
+                status = "OK" if error < 0.03 else ("WARN" if error < 0.06 else "BAD")
+                print(f"    {bin_key:<14s} {avg_n:>8,} {avg_pred:>10.4f} {avg_actual:>10.4f} {error:>10.4f} {status:>8s}")
 
     return all_results
 
