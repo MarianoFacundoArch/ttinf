@@ -56,7 +56,6 @@ PARAMS = {
     "reg_alpha":        0.1,
     "reg_lambda":       1.0,
     "max_bin":          255,
-    "is_unbalance":     True,
     "verbose":          -1,
     "seed":             42,
     "num_threads":      -1,
@@ -108,10 +107,22 @@ def get_day_boundaries(df):
 # Training
 # ---------------------------------------------------------------------------
 
+def _compute_sample_weights(y):
+    """Compute sample weights inversely proportional to class frequency."""
+    classes, counts = np.unique(y, return_counts=True)
+    n_samples = len(y)
+    n_classes = len(classes)
+    # weight = n_samples / (n_classes * count_of_class)
+    class_weights = {c: n_samples / (n_classes * cnt) for c, cnt in zip(classes, counts)}
+    return np.array([class_weights[yi] for yi in y], dtype=np.float64)
+
+
 def train_lgb(X_train, y_train, X_val, y_val):
-    """Train LightGBM with early stopping. Returns (model, best_iteration)."""
-    dtrain = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_COLUMNS, free_raw_data=False)
-    dval   = lgb.Dataset(X_val, label=y_val, reference=dtrain, free_raw_data=False)
+    """Train LightGBM with early stopping and class balancing. Returns (model, best_iteration)."""
+    w_train = _compute_sample_weights(y_train)
+    w_val   = _compute_sample_weights(y_val)
+    dtrain = lgb.Dataset(X_train, label=y_train, weight=w_train, feature_name=FEATURE_COLUMNS, free_raw_data=False)
+    dval   = lgb.Dataset(X_val, label=y_val, weight=w_val, reference=dtrain, free_raw_data=False)
 
     model = lgb.train(
         PARAMS,
