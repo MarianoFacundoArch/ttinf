@@ -216,7 +216,9 @@ class LiveBuffer:
         else:
             day.ob_fut = {'ts': np.array([], dtype=np.int64),
                           'mid': np.array([]), 'spread_bps': np.array([]),
-                          'imb_L1': np.array([]), 'imb_L5': np.array([])}
+                          'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                          'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                          'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
 
         # Orderbook spot
         n = len(self.ob_spot_ts)
@@ -230,7 +232,9 @@ class LiveBuffer:
         else:
             day.ob_spot = {'ts': np.array([], dtype=np.int64),
                            'mid': np.array([]), 'spread_bps': np.array([]),
-                           'imb_L1': np.array([]), 'imb_L5': np.array([])}
+                           'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                           'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                           'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
 
         # Mark price
         n = len(self.mp_ts)

@@ -141,6 +141,10 @@ FEATURE_GROUPS = {
         "buy_pressure_acceleration", "volume_acceleration", "cumulative_volume_delta_norm",
         "bid_depth_change_pct_5s", "ask_depth_change_pct_5s", "spread_change_ratio_10s",
     ],
+    "orderbook_at_open": [
+        "ob_bid_vol_near_open", "ob_ask_vol_near_open",
+        "ob_imbalance_at_open", "ob_volume_to_cross_open_pct",
+    ],
 }
 
 

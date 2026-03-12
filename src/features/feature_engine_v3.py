@@ -93,6 +93,10 @@ def _precompute_book(ts, bid_prices, bid_qtys, ask_prices, ask_qtys):
         'spread_bps': spread_bps,
         'imb_L1': imb_L1,
         'imb_L5': imb_L5,
+        'bid_prices': bid_prices,
+        'bid_qtys': bid_qtys,
+        'ask_prices': ask_prices,
+        'ask_qtys': ask_qtys,
     }
 
 
@@ -925,6 +929,86 @@ def compute_flow_dynamics(day, T_ms, block_start_ms):
 
 
 # ---------------------------------------------------------------------------
+# Group I: Orderbook at open price (4 features)
+# ---------------------------------------------------------------------------
+
+def compute_orderbook_at_open(day, T_ms, open_ref):
+    """Orderbook features relative to the block open price.
+
+    Measures support/resistance at the critical level that determines
+    whether the block closes UP or DOWN.
+    """
+    f = {}
+    THRESHOLD_BPS = 10
+    ob = day.ob_fut
+
+    has_raw = ('bid_prices' in ob and len(ob['bid_prices']) > 0)
+
+    if not has_raw or open_ref <= 0 or len(ob['ts']) == 0:
+        f['ob_bid_vol_near_open'] = 0.0
+        f['ob_ask_vol_near_open'] = 0.0
+        f['ob_imbalance_at_open'] = 0.0
+        f['ob_volume_to_cross_open_pct'] = 0.0
+        return f
+
+    idx = _last_before(ob['ts'], T_ms)
+    if idx < 0:
+        f['ob_bid_vol_near_open'] = 0.0
+        f['ob_ask_vol_near_open'] = 0.0
+        f['ob_imbalance_at_open'] = 0.0
+        f['ob_volume_to_cross_open_pct'] = 0.0
+        return f
+
+    bp = ob['bid_prices'][idx]  # (20,)
+    bq = ob['bid_qtys'][idx]
+    ap = ob['ask_prices'][idx]
+    aq = ob['ask_qtys'][idx]
+
+    threshold_price = open_ref * THRESHOLD_BPS / 10_000
+
+    # Bid volume near open: levels within [open - threshold, open]
+    bid_valid = bp > 0
+    bid_near = bid_valid & (bp >= open_ref - threshold_price) & (bp <= open_ref)
+    bid_near_vol = bq[bid_near].sum()
+    total_bid_vol = bq[bid_valid].sum()
+
+    # Ask volume near open: levels within [open, open + threshold]
+    ask_valid = ap > 0
+    ask_near = ask_valid & (ap >= open_ref) & (ap <= open_ref + threshold_price)
+    ask_near_vol = aq[ask_near].sum()
+    total_ask_vol = aq[ask_valid].sum()
+
+    # Feature 1: Bid volume concentration near open (support)
+    f['ob_bid_vol_near_open'] = float(
+        bid_near_vol / total_bid_vol if total_bid_vol > 0 else 0.0)
+
+    # Feature 2: Ask volume concentration near open (resistance)
+    f['ob_ask_vol_near_open'] = float(
+        ask_near_vol / total_ask_vol if total_ask_vol > 0 else 0.0)
+
+    # Feature 3: Imbalance at open level
+    total_near = bid_near_vol + ask_near_vol
+    f['ob_imbalance_at_open'] = float(
+        (bid_near_vol - ask_near_vol) / total_near if total_near > 0 else 0.0)
+
+    # Feature 4: Volume between current price and open / total on that side
+    # Measures how much needs to be traded through to cross the open
+    mid = (bp[0] + ap[0]) / 2.0 if bp[0] > 0 and ap[0] > 0 else 0.0
+    if mid > open_ref and total_bid_vol > 0:
+        # Price above open: bid volume at levels >= open = support
+        cross_vol = bq[bid_valid & (bp >= open_ref)].sum()
+        f['ob_volume_to_cross_open_pct'] = float(cross_vol / total_bid_vol)
+    elif mid < open_ref and total_ask_vol > 0:
+        # Price below open: ask volume at levels <= open = resistance
+        cross_vol = aq[ask_valid & (ap <= open_ref)].sum()
+        f['ob_volume_to_cross_open_pct'] = float(cross_vol / total_ask_vol)
+    else:
+        f['ob_volume_to_cross_open_pct'] = 0.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # Feature column list (programmatically generated)
 # ---------------------------------------------------------------------------
 
@@ -1012,6 +1096,12 @@ def _build_feature_columns():
         "bid_depth_change_pct_5s", "ask_depth_change_pct_5s", "spread_change_ratio_10s",
     ]
 
+    # Group I: Orderbook at open (4)
+    cols += [
+        "ob_bid_vol_near_open", "ob_ask_vol_near_open",
+        "ob_imbalance_at_open", "ob_volume_to_cross_open_pct",
+    ]
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -1085,5 +1175,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group H: Flow dynamics
     feats.update(compute_flow_dynamics(day, T_ms, block_start_ms))
+
+    # Group I: Orderbook at open
+    feats.update(compute_orderbook_at_open(day, T_ms, open_ref))
 
     return feats

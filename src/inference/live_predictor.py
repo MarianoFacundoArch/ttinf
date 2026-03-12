@@ -9,7 +9,6 @@ import lightgbm as lgb
 from pathlib import Path
 
 from src.features.feature_engine_v3 import (
-    FEATURE_COLUMNS_V3,
     build_ref_price,
     compute_features_v3,
 )
@@ -36,7 +35,10 @@ class LivePredictor:
         with open(model_dir / "calibrators_v3.pkl", "rb") as f:
             self.calibrators = pickle.load(f)
 
-        self.feature_cols = FEATURE_COLUMNS_V3
+        # Read feature columns from model file (matches the trained model)
+        cols_file = model_dir / "feature_columns_v3.txt"
+        with open(cols_file) as fh:
+            self.feature_cols = [line.strip() for line in fh if line.strip()]
 
         # Block tracking
         self.current_block_start_ms = 0
