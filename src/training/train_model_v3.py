@@ -172,11 +172,17 @@ def baseline_brownian(dist_to_open_bps, realized_vol, seconds_to_expiry):
     Baseline 2: Brownian motion probability.
     P(Up) = Phi(dist_to_open / (sigma * sqrt(time_left)))
     """
+    dist = np.nan_to_num(dist_to_open_bps, nan=0.0)
     sigma = np.where(realized_vol > 0, realized_vol, 1.0)
+    sigma = np.nan_to_num(sigma, nan=1.0)
     time_left = np.where(seconds_to_expiry > 0, seconds_to_expiry, 0.01)
-    z = dist_to_open_bps / (sigma * np.sqrt(time_left))
+    time_left = np.nan_to_num(time_left, nan=0.01)
+    z = dist / (sigma * np.sqrt(time_left))
     z = np.clip(z, -10, 10)
-    return norm.cdf(z)
+    proba = norm.cdf(z)
+    # Ensure no NaN/Inf in output
+    proba = np.nan_to_num(proba, nan=0.5, posinf=1.0, neginf=0.0)
+    return proba
 
 
 def evaluate_baseline(name, y_true, y_pred_proba, y_pred_class):
@@ -287,8 +293,9 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
     print(f"     Samples:    {len(y):,}")
 
     # --- 2. Baselines comparison ---
-    bl_naive_pred = baseline_naive(dist_bps)
-    bl_naive_proba = (dist_bps >= 0).astype(float)
+    dist_bps_clean = np.nan_to_num(dist_bps, nan=0.0)
+    bl_naive_pred = baseline_naive(dist_bps_clean)
+    bl_naive_proba = (dist_bps_clean >= 0).astype(float)
     bl_naive = evaluate_baseline("naive", y, bl_naive_proba, bl_naive_pred)
 
     bl_bm_proba = baseline_brownian(dist_bps, vol, seconds)
