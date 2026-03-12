@@ -285,8 +285,9 @@ async def ws_futures_stream(buffer, stop_event):
     while not stop_event.is_set():
         try:
             async with websockets.connect(url, ssl=SSL_CONTEXT,
-                                          ping_interval=30,
-                                          ping_timeout=20) as ws:
+                                          ping_interval=None,
+                                          ping_timeout=None,
+                                          max_size=2**22) as ws:
                 async for msg in ws:
                     if stop_event.is_set():
                         break
@@ -498,7 +499,7 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
 
             warming = ""
             if len(predictor.block_results) == 0:
-                warming = " [WARMING UP]"
+                warming = " *** WARMING UP ***"
 
             print(f"  {now_str} | {secs:5.0f}s | "
                   f"BTC {price:>10,.2f} | "
@@ -506,7 +507,9 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                   f"P(Up): {p_cal:.3f} | "
                   f"BM: {p_bm:.3f} | "
                   f"edge: {p_cal - p_bm:>+.3f} | "
-                  f"{signal}{warming}")
+                  f"{signal}")
+            if warming:
+                print(warming)
 
             # Broadcast to websocket clients
             if ws_clients:
