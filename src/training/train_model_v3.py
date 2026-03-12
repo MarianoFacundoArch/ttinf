@@ -77,11 +77,14 @@ TIME_BUCKETS = [
     (0,    30, "0-30s (late)"),
 ]
 
-# Phase buckets for reporting
+# Phase buckets for reporting (6 phases, 50s each)
 PHASE_BUCKETS = [
-    (240, 300, "early (240-300s)"),
-    (120, 240, "mid (120-240s)"),
-    (0,   120, "late (0-120s)"),
+    (250, 300, "very_early (250-300s)"),
+    (200, 250, "early (200-250s)"),
+    (150, 200, "mid_early (150-200s)"),
+    (100, 150, "mid_late (100-150s)"),
+    (50,  100, "late (50-100s)"),
+    (0,    50, "very_late (0-50s)"),
 ]
 
 # Feature groups for importance aggregation
@@ -343,7 +346,7 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
         bm_acc = accuracy_score(y_m, bm_pred)
 
         print(f"     {label:<22s} {mask.sum():>8,} {acc_m:>8.4f} {ll_m:>10.6f} {auc_m:>8.4f} {acc_m - bm_acc:>+10.4f}")
-        phase_results[label] = {"accuracy": acc_m, "logloss": ll_m, "auc": auc_m}
+        phase_results[label] = {"accuracy": acc_m, "logloss": ll_m, "auc": auc_m, "vs_bm_acc": acc_m - bm_acc}
 
     # --- 4. Calibration ---
     print(f"\n  4. CALIBRATION")
@@ -610,6 +613,21 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
               f"delta_acc={best_fold['delta_vs_bm_acc']:+.4f})")
         print(f"  Worst fold: {worst_fold['fold']} ({worst_fold['test_start']} to {worst_fold['test_end']}, "
               f"delta_acc={worst_fold['delta_vs_bm_acc']:+.4f})")
+
+        # Phase summary across all folds
+        print(f"\n  ACCURACY BY PHASE (averaged across {len(all_results)} folds)")
+        print(f"  {'Phase':<25s} {'Acc':>8s} {'AUC':>8s} {'vs_BM':>8s} {'Std':>8s}")
+        phase_labels = [label for _, _, label in PHASE_BUCKETS]
+        for label in phase_labels:
+            accs = [r["phase_results"][label]["accuracy"]
+                    for r in all_results if label in r.get("phase_results", {})]
+            aucs = [r["phase_results"][label]["auc"]
+                    for r in all_results if label in r.get("phase_results", {})]
+            vs_bm = [r["phase_results"][label].get("vs_bm_acc", 0.0)
+                     for r in all_results if label in r.get("phase_results", {})]
+            if accs:
+                print(f"  {label:<25s} {np.mean(accs):>8.4f} {np.mean(aucs):>8.4f} "
+                      f"{np.mean(vs_bm):>+8.4f} {np.std(accs):>8.4f}")
 
     return all_results
 
