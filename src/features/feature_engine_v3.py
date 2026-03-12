@@ -757,41 +757,67 @@ def compute_derived(feats, ref, T_ms, block_start_ms):
     # 1. brownian_prob: Φ(z) — the Brownian baseline probability
     f["brownian_prob"] = float(norm.cdf(np.clip(z, -10, 10)))
 
-    # 2. brownian_prob_drift: Φ(z_adjusted) — Brownian adjusted by recent drift
-    #    Uses return_30s as drift estimate over 30 seconds
-    mu_hat = feats.get("return_30s", 0.0) / 30.0  # bps per second
+    # 2. brownian_prob_drift_30: Φ(z_adjusted) — Brownian with 30s drift
+    mu_30 = feats.get("return_30s", 0.0) / 30.0  # bps per second
     if sigma > 0 and seconds_to_expiry > 0:
-        drift_adjustment = mu_hat * seconds_to_expiry
-        z_drift = (dist_bps + drift_adjustment) / (sigma * np.sqrt(seconds_to_expiry))
-        f["brownian_prob_drift"] = float(norm.cdf(np.clip(z_drift, -10, 10)))
+        z_drift_30 = (dist_bps + mu_30 * seconds_to_expiry) / (sigma * np.sqrt(seconds_to_expiry))
+        f["brownian_prob_drift_30"] = float(norm.cdf(np.clip(z_drift_30, -10, 10)))
     else:
-        f["brownian_prob_drift"] = f["brownian_prob"]
+        f["brownian_prob_drift_30"] = f["brownian_prob"]
 
-    # 3. z_velocity: rate of change of z over last 5 seconds
-    #    Approximated from return_5s normalized by sigma and sqrt(time)
+    # 3. brownian_prob_drift_10: Φ(z_adjusted) — Brownian with 10s drift
+    mu_10 = feats.get("return_10s", 0.0) / 10.0
+    if sigma > 0 and seconds_to_expiry > 0:
+        z_drift_10 = (dist_bps + mu_10 * seconds_to_expiry) / (sigma * np.sqrt(seconds_to_expiry))
+        f["brownian_prob_drift_10"] = float(norm.cdf(np.clip(z_drift_10, -10, 10)))
+    else:
+        f["brownian_prob_drift_10"] = f["brownian_prob"]
+
+    # 4. z_velocity: rate of change of z over last 5 seconds
     return_5s = feats.get("return_5s", 0.0)
     if sigma > 0 and seconds_to_expiry > 0:
-        # z at T-5s ≈ (dist_bps - return_5s) / (sigma * sqrt(seconds_to_expiry + 5))
         z_prev = (dist_bps - return_5s) / (sigma * np.sqrt(seconds_to_expiry + 5))
         f["z_velocity"] = (z - z_prev) / 5.0
     else:
         f["z_velocity"] = 0.0
 
-    # 4. bridge_variance: σ² × t_elapsed × t_remaining / T_total
-    #    Peaks at mid-block, measures uncertainty independent of direction
-    if sigma > 0:
-        f["bridge_variance"] = sigma**2 * t_elapsed * seconds_to_expiry / T_total
+    # 5. z_acceleration: second derivative of z (is momentum increasing or fading?)
+    return_10s = feats.get("return_10s", 0.0)
+    if sigma > 0 and seconds_to_expiry > 0:
+        z_prev_5 = (dist_bps - return_5s) / (sigma * np.sqrt(seconds_to_expiry + 5))
+        z_prev_10 = (dist_bps - return_10s) / (sigma * np.sqrt(seconds_to_expiry + 10))
+        f["z_acceleration"] = z - 2 * z_prev_5 + z_prev_10
     else:
-        f["bridge_variance"] = 0.0
+        f["z_acceleration"] = 0.0
 
-    # 5. vol_ratio: realized_vol_since_open / realized_vol_60s
-    #    Detects volatility regime change within the block
+    # 6. remaining_sigma: σ × √τ — uncertainty remaining until block close
+    if sigma > 0 and seconds_to_expiry > 0:
+        f["remaining_sigma"] = sigma * np.sqrt(seconds_to_expiry)
+    else:
+        f["remaining_sigma"] = 0.0
+
+    # 7. vol_ratio: realized_vol_since_open / realized_vol_60s
     vol_open = feats.get("realized_vol_since_open", 0.0)
     vol_60 = feats.get("realized_vol_60s", 0.0)
     if vol_60 > 0:
         f["vol_ratio"] = vol_open / vol_60
     else:
         f["vol_ratio"] = 1.0
+
+    # 8. persistence_delta: is the advantage consolidating or fading?
+    pct_all = feats.get("pct_time_above_open", 0.5)
+    pct_30s = feats.get("pct_time_above_open_last_30s", 0.5)
+    f["persistence_delta"] = pct_30s - pct_all
+
+    # 9. flow_alignment: does order flow support the current position?
+    #    positive = flow confirms direction, negative = flow contradicts
+    signed_vol_z = feats.get("fut_signed_vol_z_10s", 0.0)
+    if dist_bps > 0:
+        f["flow_alignment"] = signed_vol_z
+    elif dist_bps < 0:
+        f["flow_alignment"] = -signed_vol_z
+    else:
+        f["flow_alignment"] = 0.0
 
     return f
 
@@ -870,10 +896,11 @@ def _build_feature_columns():
         "missing_stream_count", "open_ref_quality_flag", "core_streams_fresh_flag",
     ]
 
-    # Group G: Derived / pre-computed (5)
+    # Group G: Derived / pre-computed (9)
     cols += [
-        "brownian_prob", "brownian_prob_drift", "z_velocity",
-        "bridge_variance", "vol_ratio",
+        "brownian_prob", "brownian_prob_drift_30", "brownian_prob_drift_10",
+        "z_velocity", "z_acceleration", "remaining_sigma",
+        "vol_ratio", "persistence_delta", "flow_alignment",
     ]
 
     # Deduplicate (minutes_to_funding appears in C and E)

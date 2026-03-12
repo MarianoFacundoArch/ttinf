@@ -132,8 +132,9 @@ FEATURE_GROUPS = {
         "missing_stream_count", "open_ref_quality_flag", "core_streams_fresh_flag",
     ],
     "derived": [
-        "brownian_prob", "brownian_prob_drift", "z_velocity",
-        "bridge_variance", "vol_ratio",
+        "brownian_prob", "brownian_prob_drift_30", "brownian_prob_drift_10",
+        "z_velocity", "z_acceleration", "remaining_sigma",
+        "vol_ratio", "persistence_delta", "flow_alignment",
     ],
 }
 
