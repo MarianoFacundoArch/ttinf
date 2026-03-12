@@ -145,6 +145,9 @@ FEATURE_GROUPS = {
         "ob_bid_vol_near_open", "ob_ask_vol_near_open",
         "ob_imbalance_at_open", "ob_volume_to_cross_open_pct",
     ],
+    "vpin": [
+        "vpin_30s", "vpin_signed_30s", "vpin_120s", "vpin_spike",
+    ],
 }
 
 
@@ -638,6 +641,50 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
         result["n_train"] = len(df_train)
         result["n_calib"] = len(df_calib)
         result["n_test"] = len(df_test)
+
+        # --- Disagreement analysis: model vs Brownian ---
+        test_proba = model.predict(X_test)
+        test_seconds = df_test["seconds_to_expiry"].values
+        test_dist = df_test["dist_to_open_bps"].values
+        test_vol = df_test["realized_vol_60s"].values
+        y_cal_test = apply_calibrators(test_proba, test_seconds, calibrators)
+        bm_proba = baseline_brownian(test_dist, test_vol, test_seconds)
+
+        disagree_results = {}
+        for thresh in [0.03, 0.05, 0.10]:
+            diff = y_cal_test - bm_proba
+            disagree_mask = np.abs(diff) > thresh
+            n_disagree = disagree_mask.sum()
+            if n_disagree < 20:
+                continue
+
+            # When model is more bullish than Brownian
+            bullish = disagree_mask & (diff > 0)
+            # When model is more bearish
+            bearish = disagree_mask & (diff < 0)
+
+            model_right = 0
+            bm_right = 0
+            if bullish.sum() > 0:
+                # Model says more UP, check if UP actually won
+                model_right += y_test[bullish].sum()
+                bm_right += (1 - y_test[bullish]).sum()
+            if bearish.sum() > 0:
+                # Model says more DOWN, check if DOWN actually won
+                model_right += (1 - y_test[bearish]).sum()
+                bm_right += y_test[bearish].sum()
+
+            total = model_right + bm_right
+            model_pct = model_right / total if total > 0 else 0.5
+            avg_diff = float(np.abs(diff[disagree_mask]).mean())
+
+            disagree_results[f"thresh_{thresh}"] = {
+                "n_disagree": int(n_disagree),
+                "model_right_pct": float(model_pct),
+                "avg_disagreement": avg_diff,
+            }
+
+        result["disagreement"] = disagree_results
         all_results.append(result)
 
         start += step_days
@@ -701,6 +748,23 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
             if accs:
                 print(f"  {label:<12s} {np.mean(accs):>8.4f} {np.mean(bm_accs):>8.4f} "
                       f"{np.mean(accs) - np.mean(bm_accs):>+8.4f} {np.mean(eces):>8.4f} {int(np.mean(rows)):>10,}")
+
+        # Disagreement analysis summary
+        print(f"\n  MODEL vs BROWNIAN DISAGREEMENT (averaged across {len(all_results)} folds)")
+        print(f"  {'Threshold':<12s} {'N_disagree':>12s} {'Model_right%':>14s} {'Avg_diff':>10s} {'Verdict':>10s}")
+        for thresh in [0.03, 0.05, 0.10]:
+            key = f"thresh_{thresh}"
+            ns = [r["disagreement"][key]["n_disagree"]
+                  for r in all_results if key in r.get("disagreement", {})]
+            mrs = [r["disagreement"][key]["model_right_pct"]
+                   for r in all_results if key in r.get("disagreement", {})]
+            diffs = [r["disagreement"][key]["avg_disagreement"]
+                     for r in all_results if key in r.get("disagreement", {})]
+            if mrs:
+                avg_mr = np.mean(mrs)
+                verdict = "MODEL" if avg_mr > 0.52 else ("BROWNIAN" if avg_mr < 0.48 else "TIE")
+                print(f"  |diff|>{thresh:<5.2f}  {int(np.mean(ns)):>12,} {avg_mr:>13.1%} "
+                      f"{np.mean(diffs):>10.4f} {verdict:>10s}")
 
     return all_results
 

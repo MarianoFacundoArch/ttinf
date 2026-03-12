@@ -929,6 +929,89 @@ def compute_flow_dynamics(day, T_ms, block_start_ms):
 
 
 # ---------------------------------------------------------------------------
+# Group J: VPIN — Volume-Synchronized Probability of Informed Trading (4 features)
+# ---------------------------------------------------------------------------
+
+def compute_vpin(day, T_ms):
+    """VPIN features using volume-synchronized buckets.
+
+    Unlike time-based buy_pct, VPIN normalizes for varying trade intensity
+    and detects informed flow even when trade counts are balanced but
+    volumes are not.
+    """
+    f = {}
+
+    def _vpin_from_trades(ts, qty, ibm, start_ms, end_ms, n_buckets=10):
+        """Compute VPIN and signed VPIN from trades in a time window.
+
+        Divides trades into n_buckets equal-volume buckets, then measures
+        how one-sided each bucket is.
+        Returns (vpin, signed_vpin).
+        """
+        i0 = np.searchsorted(ts, start_ms, side='left')
+        i1 = np.searchsorted(ts, end_ms, side='right')
+        if i1 - i0 < 10:
+            return 0.0, 0.0
+
+        q = qty[i0:i1]
+        is_bm = ibm[i0:i1]
+        total_vol = q.sum()
+        if total_vol <= 0:
+            return 0.0, 0.0
+
+        bucket_vol = total_vol / n_buckets
+        if bucket_vol <= 0:
+            return 0.0, 0.0
+
+        # Accumulate into volume buckets
+        cum_vol = 0.0
+        bucket_buy = 0.0
+        bucket_sell = 0.0
+        abs_imbalances = []
+        signed_imbalances = []
+
+        for j in range(i1 - i0):
+            trade_qty = q[j]
+            if is_bm[j]:
+                bucket_sell += trade_qty  # buyer is maker → taker sold
+            else:
+                bucket_buy += trade_qty   # taker bought
+
+            cum_vol += trade_qty
+
+            if cum_vol >= bucket_vol:
+                bkt_total = bucket_buy + bucket_sell
+                if bkt_total > 0:
+                    abs_imbalances.append(abs(bucket_buy - bucket_sell) / bkt_total)
+                    signed_imbalances.append((bucket_buy - bucket_sell) / bkt_total)
+                bucket_buy = 0.0
+                bucket_sell = 0.0
+                cum_vol = 0.0
+
+        if not abs_imbalances:
+            return 0.0, 0.0
+
+        vpin = float(np.mean(abs_imbalances))
+        signed_vpin = float(np.mean(signed_imbalances))
+        return vpin, signed_vpin
+
+    # VPIN over 30s (short-term)
+    vpin_30, signed_30 = _vpin_from_trades(
+        day.tf_ts, day.tf_qty, day.tf_ibm, T_ms - 30_000, T_ms, n_buckets=10)
+
+    # VPIN over 120s (baseline)
+    vpin_120, _ = _vpin_from_trades(
+        day.tf_ts, day.tf_qty, day.tf_ibm, T_ms - 120_000, T_ms, n_buckets=20)
+
+    f['vpin_30s'] = vpin_30
+    f['vpin_signed_30s'] = signed_30
+    f['vpin_120s'] = vpin_120
+    f['vpin_spike'] = _safe_div(vpin_30, vpin_120, 1.0)
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # Group I: Orderbook at open price (4 features)
 # ---------------------------------------------------------------------------
 
@@ -1102,6 +1185,11 @@ def _build_feature_columns():
         "ob_imbalance_at_open", "ob_volume_to_cross_open_pct",
     ]
 
+    # Group J: VPIN (4)
+    cols += [
+        "vpin_30s", "vpin_signed_30s", "vpin_120s", "vpin_spike",
+    ]
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -1178,5 +1266,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group I: Orderbook at open
     feats.update(compute_orderbook_at_open(day, T_ms, open_ref))
+
+    # Group J: VPIN
+    feats.update(compute_vpin(day, T_ms))
 
     return feats
