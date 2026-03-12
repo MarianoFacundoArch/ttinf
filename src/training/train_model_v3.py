@@ -25,7 +25,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from scipy.stats import norm
+from scipy.stats import binomtest, norm
 from sklearn.calibration import calibration_curve
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
@@ -750,6 +750,49 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
             }
         result["calib_quality"] = calib_quality
 
+        # --- Edge by confidence level ---
+        confidence = np.abs(y_cal_test - 0.5)
+        model_pred_class = (y_cal_test >= 0.5).astype(int)
+        confidence_edge = {}
+        for conf_lo, conf_hi, conf_label in [
+            (0.00, 0.05, "low (0.45-0.55)"),
+            (0.05, 0.10, "med (0.40-0.60)"),
+            (0.10, 0.15, "high (0.35-0.65)"),
+            (0.15, 0.25, "very high (0.25-0.75)"),
+            (0.25, 0.50, "extreme (<0.25 or >0.75)"),
+        ]:
+            c_mask = (confidence >= conf_lo) & (confidence < conf_hi)
+            n_c = c_mask.sum()
+            if n_c < 20:
+                continue
+            acc_c = float(accuracy_score(y_test[c_mask], model_pred_class[c_mask]))
+            bm_pred_c = (bm_proba[c_mask] >= 0.5).astype(int)
+            acc_bm_c = float(accuracy_score(y_test[c_mask], bm_pred_c))
+            confidence_edge[conf_label] = {
+                "n": int(n_c),
+                "model_acc": acc_c,
+                "bm_acc": acc_bm_c,
+                "edge": acc_c - acc_bm_c,
+            }
+        result["confidence_edge"] = confidence_edge
+
+        # --- Statistical significance (binomial test) for directional by time bucket ---
+        stat_sig = {}
+        for lo, hi, label in TIME_BUCKETS:
+            t_mask = (test_seconds >= lo) & (test_seconds < hi)
+            dir_t = dir_disagree & t_mask
+            n_t = int(dir_t.sum())
+            if n_t < 10:
+                continue
+            k = int((model_dir[dir_t] == y_test[dir_t]).sum())
+            pval = float(binomtest(k, n_t, 0.5, alternative='greater').pvalue)
+            stat_sig[label] = {
+                "n": n_t, "k_right": k, "pct": k / n_t,
+                "pvalue": pval,
+                "significant": pval < 0.05,
+            }
+        result["stat_significance"] = stat_sig
+
         all_results.append(result)
 
         start += step_days
@@ -906,6 +949,40 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
                 error = abs(avg_pred - avg_actual)
                 status = "OK" if error < 0.03 else ("WARN" if error < 0.06 else "BAD")
                 print(f"    {bin_key:<14s} {avg_n:>8,} {avg_pred:>10.4f} {avg_actual:>10.4f} {error:>10.4f} {status:>8s}")
+
+        # E) Edge by confidence level
+        print(f"\n  EDGE BY MODEL CONFIDENCE (averaged across {len(all_results)} folds)")
+        print(f"  {'Confidence':<25s} {'N':>8s} {'Model_Acc':>10s} {'BM_Acc':>10s} {'Edge':>8s}")
+        for conf_label in ["low (0.45-0.55)", "med (0.40-0.60)", "high (0.35-0.65)",
+                           "very high (0.25-0.75)", "extreme (<0.25 or >0.75)"]:
+            accs = [r["confidence_edge"][conf_label]["model_acc"]
+                    for r in all_results if conf_label in r.get("confidence_edge", {})]
+            bm_accs = [r["confidence_edge"][conf_label]["bm_acc"]
+                       for r in all_results if conf_label in r.get("confidence_edge", {})]
+            ns = [r["confidence_edge"][conf_label]["n"]
+                  for r in all_results if conf_label in r.get("confidence_edge", {})]
+            if accs:
+                print(f"  {conf_label:<25s} {int(np.mean(ns)):>8,} {np.mean(accs):>10.4f} "
+                      f"{np.mean(bm_accs):>10.4f} {np.mean(accs)-np.mean(bm_accs):>+8.4f}")
+
+        # F) Statistical significance of directional edge by time bucket
+        print(f"\n  STATISTICAL SIGNIFICANCE (directional edge, binomial test, averaged across {len(all_results)} folds)")
+        print(f"  {'Bucket':<22s} {'N':>8s} {'Model_right%':>14s} {'Avg_pvalue':>12s} {'Significant':>12s}")
+        for _, _, label in TIME_BUCKETS:
+            pvals = [r["stat_significance"][label]["pvalue"]
+                     for r in all_results
+                     if label in r.get("stat_significance", {})]
+            pcts = [r["stat_significance"][label]["pct"]
+                    for r in all_results
+                    if label in r.get("stat_significance", {})]
+            ns = [r["stat_significance"][label]["n"]
+                  for r in all_results
+                  if label in r.get("stat_significance", {})]
+            if pvals:
+                avg_pval = np.mean(pvals)
+                sig_count = sum(1 for p in pvals if p < 0.05)
+                print(f"  {label:<22s} {int(np.mean(ns)):>8,} {np.mean(pcts):>13.1%} "
+                      f"{avg_pval:>12.4f} {sig_count}/{len(pvals)} folds")
 
     return all_results
 
