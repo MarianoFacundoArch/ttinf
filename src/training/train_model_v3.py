@@ -650,39 +650,63 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
         y_cal_test = apply_calibrators(test_proba, test_seconds, calibrators)
         bm_proba = baseline_brownian(test_dist, test_vol, test_seconds)
 
+        model_dir = (y_cal_test >= 0.5).astype(int)  # 1=UP, 0=DOWN
+        bm_dir = (bm_proba >= 0.5).astype(int)
+
         disagree_results = {}
+
+        # --- A) Directional disagreement (model says UP, Brownian says DOWN or vice versa) ---
+        dir_disagree = model_dir != bm_dir
+        n_dir = dir_disagree.sum()
+        if n_dir >= 20:
+            model_right_dir = accuracy_score(y_test[dir_disagree], model_dir[dir_disagree])
+            disagree_results["directional"] = {
+                "n": int(n_dir),
+                "pct_of_total": float(n_dir / len(y_test)),
+                "model_right_pct": float(model_right_dir),
+            }
+
+        # --- B) Magnitude disagreement (same direction, different confidence) ---
+        same_dir = model_dir == bm_dir
         for thresh in [0.03, 0.05, 0.10]:
             diff = y_cal_test - bm_proba
-            disagree_mask = np.abs(diff) > thresh
-            n_disagree = disagree_mask.sum()
-            if n_disagree < 20:
+            mag_disagree = same_dir & (np.abs(diff) > thresh)
+            n_mag = mag_disagree.sum()
+            if n_mag < 20:
                 continue
-
-            # When model is more bullish than Brownian
-            bullish = disagree_mask & (diff > 0)
-            # When model is more bearish
-            bearish = disagree_mask & (diff < 0)
-
+            # Model more confident UP (both say UP, model higher prob)
+            more_bullish = mag_disagree & (diff > 0)
+            # Model more confident DOWN (both say DOWN, model lower prob)
+            more_bearish = mag_disagree & (diff < 0)
             model_right = 0
-            bm_right = 0
-            if bullish.sum() > 0:
-                # Model says more UP, check if UP actually won
-                model_right += y_test[bullish].sum()
-                bm_right += (1 - y_test[bullish]).sum()
-            if bearish.sum() > 0:
-                # Model says more DOWN, check if DOWN actually won
-                model_right += (1 - y_test[bearish]).sum()
-                bm_right += y_test[bearish].sum()
-
-            total = model_right + bm_right
+            total = 0
+            if more_bullish.sum() > 0:
+                model_right += y_test[more_bullish].sum()
+                total += more_bullish.sum()
+            if more_bearish.sum() > 0:
+                model_right += (1 - y_test[more_bearish]).sum()
+                total += more_bearish.sum()
             model_pct = model_right / total if total > 0 else 0.5
-            avg_diff = float(np.abs(diff[disagree_mask]).mean())
-
-            disagree_results[f"thresh_{thresh}"] = {
-                "n_disagree": int(n_disagree),
+            disagree_results[f"magnitude_{thresh}"] = {
+                "n": int(n_mag),
                 "model_right_pct": float(model_pct),
-                "avg_disagreement": avg_diff,
+                "avg_diff": float(np.abs(diff[mag_disagree]).mean()),
             }
+
+        # --- C) Directional disagreement by time bucket ---
+        time_bucket_disagree = {}
+        for lo, hi, label in TIME_BUCKETS:
+            t_mask = (test_seconds >= lo) & (test_seconds < hi)
+            dir_t = dir_disagree & t_mask
+            n_t = dir_t.sum()
+            if n_t < 10:
+                continue
+            mr = accuracy_score(y_test[dir_t], model_dir[dir_t])
+            time_bucket_disagree[label] = {
+                "n": int(n_t),
+                "model_right_pct": float(mr),
+            }
+        disagree_results["by_time_bucket"] = time_bucket_disagree
 
         result["disagreement"] = disagree_results
         all_results.append(result)
@@ -751,20 +775,54 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
 
         # Disagreement analysis summary
         print(f"\n  MODEL vs BROWNIAN DISAGREEMENT (averaged across {len(all_results)} folds)")
-        print(f"  {'Threshold':<12s} {'N_disagree':>12s} {'Model_right%':>14s} {'Avg_diff':>10s} {'Verdict':>10s}")
+
+        # A) Directional: model says UP, Brownian says DOWN (or vice versa)
+        dir_ns = [r["disagreement"]["directional"]["n"]
+                  for r in all_results if "directional" in r.get("disagreement", {})]
+        dir_mrs = [r["disagreement"]["directional"]["model_right_pct"]
+                   for r in all_results if "directional" in r.get("disagreement", {})]
+        dir_pcts = [r["disagreement"]["directional"]["pct_of_total"]
+                    for r in all_results if "directional" in r.get("disagreement", {})]
+        if dir_mrs:
+            avg_mr = np.mean(dir_mrs)
+            verdict = "MODEL" if avg_mr > 0.52 else ("BROWNIAN" if avg_mr < 0.48 else "TIE")
+            print(f"\n  A) DIRECTIONAL (model=UP vs Brownian=DOWN or vice versa)")
+            print(f"     N={int(np.mean(dir_ns)):,} ({np.mean(dir_pcts)*100:.1f}% of samples), "
+                  f"Model right: {avg_mr:.1%} → {verdict}")
+
+        # B) Magnitude: same direction, different confidence
+        print(f"\n  B) MAGNITUDE (same direction, |diff| > threshold)")
+        print(f"     {'Threshold':<12s} {'N':>8s} {'Model_right%':>14s} {'Avg_diff':>10s} {'Verdict':>10s}")
         for thresh in [0.03, 0.05, 0.10]:
-            key = f"thresh_{thresh}"
-            ns = [r["disagreement"][key]["n_disagree"]
+            key = f"magnitude_{thresh}"
+            ns = [r["disagreement"][key]["n"]
                   for r in all_results if key in r.get("disagreement", {})]
             mrs = [r["disagreement"][key]["model_right_pct"]
                    for r in all_results if key in r.get("disagreement", {})]
-            diffs = [r["disagreement"][key]["avg_disagreement"]
+            diffs = [r["disagreement"][key]["avg_diff"]
                      for r in all_results if key in r.get("disagreement", {})]
             if mrs:
                 avg_mr = np.mean(mrs)
                 verdict = "MODEL" if avg_mr > 0.52 else ("BROWNIAN" if avg_mr < 0.48 else "TIE")
-                print(f"  |diff|>{thresh:<5.2f}  {int(np.mean(ns)):>12,} {avg_mr:>13.1%} "
+                print(f"     |diff|>{thresh:<5.2f}  {int(np.mean(ns)):>8,} {avg_mr:>13.1%} "
                       f"{np.mean(diffs):>10.4f} {verdict:>10s}")
+
+        # C) Directional by time bucket
+        print(f"\n  C) DIRECTIONAL BY TIME BUCKET")
+        print(f"     {'Bucket':<22s} {'N':>8s} {'Model_right%':>14s} {'Verdict':>10s}")
+        for _, _, label in TIME_BUCKETS:
+            ns = [r["disagreement"]["by_time_bucket"][label]["n"]
+                  for r in all_results
+                  if "by_time_bucket" in r.get("disagreement", {})
+                  and label in r["disagreement"]["by_time_bucket"]]
+            mrs = [r["disagreement"]["by_time_bucket"][label]["model_right_pct"]
+                   for r in all_results
+                   if "by_time_bucket" in r.get("disagreement", {})
+                   and label in r["disagreement"]["by_time_bucket"]]
+            if mrs:
+                avg_mr = np.mean(mrs)
+                verdict = "MODEL" if avg_mr > 0.52 else ("BROWNIAN" if avg_mr < 0.48 else "TIE")
+                print(f"     {label:<22s} {int(np.mean(ns)):>8,} {avg_mr:>13.1%} {verdict:>10s}")
 
     return all_results
 
