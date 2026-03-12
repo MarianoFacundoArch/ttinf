@@ -22,23 +22,22 @@ NODE.JS CLIENT EXAMPLE
     ws.on('message', (raw) => {
       const pred = JSON.parse(raw);
 
-      // pred.p_up = model's probability that the 5-min block closes above open
-      // pred.p_down = 1 - p_up
-      // pred.ece_at_bucket = calibration error for current time bucket
-      // pred.accuracy_at_bucket = model accuracy for current time bucket
+      // pred.max_buy_up = max price to pay for UP and still be +EV
+      // pred.max_buy_down = max price to pay for DOWN and still be +EV
+      // These already account for calibration error (ECE)
 
-      const polymarketPriceUp = getPolymarketPrice('UP');  // your code
+      const polyPriceUp = getPolymarketPrice('UP');      // your code
+      const polyPriceDown = getPolymarketPrice('DOWN');   // your code
       const fee = 0.02;  // Polymarket fee - adjust to actual value
 
-      const edge = pred.p_up - polymarketPriceUp;
-      const minEdge = pred.ece_at_bucket + fee;
+      if (!pred.warming_up) {
+        if (polyPriceUp < pred.max_buy_up - fee) {
+          // BUY UP — Polymarket price is below our fair value
+        }
 
-      if (edge > minEdge && !pred.warming_up) {
-        // BUY UP — model says Up is more likely than Polymarket price implies
-      }
-
-      if (-edge > minEdge && !pred.warming_up) {
-        // BUY DOWN — model says Down is more likely than Polymarket price implies
+        if (polyPriceDown < pred.max_buy_down - fee) {
+          // BUY DOWN — Polymarket price is below our fair value
+        }
       }
     });
 
@@ -61,6 +60,9 @@ JSON PAYLOAD (every second)
 
   "accuracy_at_bucket": 0.8322,      // Model accuracy at current seconds_to_expiry (from walk-forward)
   "ece_at_bucket": 0.0053,           // Calibration error at current bucket (lower = more reliable)
+
+  "max_buy_up": 0.730,              // Max price to buy UP and be +EV (p_up - ece)
+  "max_buy_down": 0.260,            // Max price to buy DOWN and be +EV (p_down - ece)
 
   "direction": "UP",                 // "UP" if p_up >= 0.5, "DOWN" otherwise
   "warming_up": false                // true = first block, no block history yet, predictions less reliable
@@ -102,6 +104,17 @@ edge_vs_brownian
   than pure math. Negative means more bearish. Typically small (-0.05 to
   +0.05). This tells you how much the model's prediction is driven by
   trade flow, orderbook, funding rate, etc. vs just price position.
+
+max_buy_up
+  Maximum price to pay for UP on Polymarket and still be profitable.
+  Calculated as p_up - ece_at_bucket. Already accounts for model
+  calibration error. You only need to subtract your Polymarket fee.
+  Example: max_buy_up = 0.730, fee = 0.02 → buy UP if Polymarket < $0.710
+
+max_buy_down
+  Maximum price to pay for DOWN on Polymarket and still be profitable.
+  Calculated as p_down - ece_at_bucket. Same logic as max_buy_up.
+  Example: max_buy_down = 0.260, fee = 0.02 → buy DOWN if Polymarket < $0.240
 
 warming_up
   True during the first 5-minute block after server start. Block history

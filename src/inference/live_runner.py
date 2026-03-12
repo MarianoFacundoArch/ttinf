@@ -497,23 +497,29 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             else:
                 signal = "FLAT ~  "
 
-            warming = ""
-            if len(predictor.block_results) == 0:
-                warming = " *** WARMING UP ***"
+            warming = len(predictor.block_results) == 0
+
+            acc_bucket, ece_bucket = get_bucket_stats(secs)
+            max_buy_up = round(p_cal - ece_bucket, 3)
+            max_buy_down = round((1.0 - p_cal) - ece_bucket, 3)
+
+            if p_cal >= 0.5:
+                buy_side = f"BUY UP < ${max_buy_up:.3f}"
+            else:
+                buy_side = f"BUY DN < ${max_buy_down:.3f}"
 
             print(f"  {now_str} | {secs:5.0f}s | "
                   f"BTC {price:>10,.2f} | "
                   f"vs open: {dist:>+7.2f} bps | "
                   f"P(Up): {p_cal:.3f} | "
-                  f"BM: {p_bm:.3f} | "
-                  f"edge: {p_cal - p_bm:>+.3f} | "
+                  f"acc: {acc_bucket:.1%} | "
+                  f"{buy_side} | "
                   f"{signal}")
             if warming:
-                print(warming)
+                print(" *** WARMING UP ***")
 
             # Broadcast to websocket clients
             if ws_clients:
-                acc_bucket, ece_bucket = get_bucket_stats(secs)
                 payload = json.dumps({
                     "block_start_ms": result["block_start_ms"],
                     "now_ms": now_ms,
@@ -527,8 +533,10 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     "edge_vs_brownian": round(float(p_cal - p_bm), 4),
                     "accuracy_at_bucket": round(acc_bucket, 4),
                     "ece_at_bucket": round(ece_bucket, 4),
+                    "max_buy_up": max_buy_up,
+                    "max_buy_down": max_buy_down,
                     "direction": result["direction"],
-                    "warming_up": len(predictor.block_results) == 0,
+                    "warming_up": warming,
                 })
                 dead = set()
                 for client in ws_clients:
