@@ -40,7 +40,7 @@ SYMBOL = "BTCUSDT"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
 
 # Expected streams for a complete day
-EXPECTED_STREAMS = [
+EXPECTED_STREAMS_BINANCE = [
     "trades_futures",
     "trades_spot",
     "bookticker_futures",
@@ -51,6 +51,17 @@ EXPECTED_STREAMS = [
     "liquidations",
     "metrics",
 ]
+
+EXPECTED_STREAMS_CROSS = [
+    "coinbase_quotes",
+    "coinbase_trades",
+    "coinbase_book_l2",
+    "bybit_quotes",
+    "bybit_trades",
+    "bybit_orderbook",
+]
+
+EXPECTED_STREAMS = EXPECTED_STREAMS_BINANCE + EXPECTED_STREAMS_CROSS
 
 # ---------------------------------------------------------------------------
 # Thread-safe progress tracker
@@ -225,12 +236,74 @@ TARDIS_DATASETS = {
             "price": "price", "amount": "qty",
         },
     },
+    # --- Coinbase ---
+    "cb_quotes": {
+        "exchange": "coinbase",
+        "data_type": "quotes",
+        "symbol": "BTC-USD",
+        "output_stream": "coinbase_quotes",
+        "column_map": {
+            "timestamp": "timestamp_ms", "bid_price": "best_bid_price",
+            "bid_amount": "best_bid_qty", "ask_price": "best_ask_price",
+            "ask_amount": "best_ask_qty",
+        },
+    },
+    "cb_trades": {
+        "exchange": "coinbase",
+        "data_type": "trades",
+        "symbol": "BTC-USD",
+        "output_stream": "coinbase_trades",
+        "column_map": {
+            "timestamp": "timestamp_ms", "id": "agg_trade_id",
+            "price": "price", "amount": "qty", "side": "_side",
+        },
+        "post_process": "trades",
+    },
+    "cb_book_l2": {
+        "exchange": "coinbase",
+        "data_type": "incremental_book_L2",
+        "symbol": "BTC-USD",
+        "output_stream": "coinbase_book_l2",
+        "post_process": "incremental_book_l2",
+    },
+    # --- Bybit Spot ---
+    "bb_quotes": {
+        "exchange": "bybit-spot",
+        "data_type": "quotes",
+        "symbol": "BTCUSDT",
+        "output_stream": "bybit_quotes",
+        "column_map": {
+            "timestamp": "timestamp_ms", "bid_price": "best_bid_price",
+            "bid_amount": "best_bid_qty", "ask_price": "best_ask_price",
+            "ask_amount": "best_ask_qty",
+        },
+    },
+    "bb_trades": {
+        "exchange": "bybit-spot",
+        "data_type": "trades",
+        "symbol": "BTCUSDT",
+        "output_stream": "bybit_trades",
+        "column_map": {
+            "timestamp": "timestamp_ms", "id": "agg_trade_id",
+            "price": "price", "amount": "qty", "side": "_side",
+        },
+        "post_process": "trades",
+    },
+    "bb_book25": {
+        "exchange": "bybit-spot",
+        "data_type": "book_snapshot_25",
+        "symbol": "BTCUSDT",
+        "output_stream": "bybit_orderbook",
+        "post_process": "book_snapshot",
+    },
 }
 
 
-def _tardis_download_csv(exchange: str, data_type: str, date_str: str) -> pd.DataFrame | None:
+def _tardis_download_csv(exchange: str, data_type: str, date_str: str,
+                         symbol: str = None) -> tuple | None:
     year, month, day = date_str.split("-")
-    url = f"{TARDIS_BASE}/{exchange}/{data_type}/{year}/{month}/{day}/{SYMBOL}.csv.gz"
+    sym = symbol or SYMBOL
+    url = f"{TARDIS_BASE}/{exchange}/{data_type}/{year}/{month}/{day}/{sym}.csv.gz"
     headers = {"Authorization": f"Bearer {TARDIS_API_KEY}"} if TARDIS_API_KEY else {}
 
     resp = requests.get(url, headers=headers, timeout=180)
@@ -279,6 +352,103 @@ def _process_book_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(result)
 
 
+def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert Coinbase incremental_book_L2 to book snapshots (20 levels).
+
+    Replays L2 updates to reconstruct the book, taking snapshots every 100ms.
+    Output format matches book_snapshot_25.
+    """
+    import numpy as np
+    from sortedcontainers import SortedDict
+
+    # Convert timestamp to ms
+    if "timestamp" in df.columns and len(df) > 0 and df["timestamp"].iloc[0] > 1e15:
+        df["timestamp"] = df["timestamp"] // 1000
+
+    timestamps = df["timestamp"].values
+    is_snapshots = df["is_snapshot"].values if "is_snapshot" in df.columns else np.zeros(len(df), dtype=bool)
+    sides = df["side"].values
+    prices = df["price"].values.astype(np.float64)
+    amounts = df["amount"].values.astype(np.float64)
+
+    bids = SortedDict()   # price -> amount (sorted ascending, we read from end)
+    asks = SortedDict()   # price -> amount (sorted ascending, we read from start)
+
+    # Pre-allocate arrays for snapshots
+    max_snaps = len(df) // 50 + 1000  # rough estimate
+    snap_ts = np.zeros(max_snaps, dtype=np.int64)
+    snap_bids_p = np.zeros((max_snaps, 20), dtype=np.float64)
+    snap_bids_q = np.zeros((max_snaps, 20), dtype=np.float64)
+    snap_asks_p = np.zeros((max_snaps, 20), dtype=np.float64)
+    snap_asks_q = np.zeros((max_snaps, 20), dtype=np.float64)
+
+    last_snap_ts = 0
+    snap_interval_ms = 100
+    snap_idx = 0
+
+    for i in range(len(timestamps)):
+        ts = int(timestamps[i])
+        price = prices[i]
+        amount = amounts[i]
+        side = sides[i]
+
+        book = bids if side == "bid" else asks
+        if amount == 0:
+            book.pop(price, None)
+        else:
+            book[price] = amount
+
+        # Take snapshot at interval
+        if ts - last_snap_ts >= snap_interval_ms and len(bids) >= 20 and len(asks) >= 20:
+            # Top 20 bids (highest prices)
+            bid_keys = bids.keys()
+            n_bids = len(bid_keys)
+            for j in range(20):
+                idx = n_bids - 1 - j
+                if idx >= 0:
+                    p = bid_keys[idx]
+                    snap_bids_p[snap_idx, j] = p
+                    snap_bids_q[snap_idx, j] = bids[p]
+
+            # Top 20 asks (lowest prices)
+            ask_keys = asks.keys()
+            for j in range(20):
+                if j < len(ask_keys):
+                    p = ask_keys[j]
+                    snap_asks_p[snap_idx, j] = p
+                    snap_asks_q[snap_idx, j] = asks[p]
+
+            snap_ts[snap_idx] = ts
+            snap_idx += 1
+            last_snap_ts = ts
+
+            if snap_idx >= max_snaps:
+                # Grow arrays
+                snap_ts = np.resize(snap_ts, max_snaps * 2)
+                snap_bids_p = np.resize(snap_bids_p, (max_snaps * 2, 20))
+                snap_bids_q = np.resize(snap_bids_q, (max_snaps * 2, 20))
+                snap_asks_p = np.resize(snap_asks_p, (max_snaps * 2, 20))
+                snap_asks_q = np.resize(snap_asks_q, (max_snaps * 2, 20))
+                max_snaps *= 2
+
+    if snap_idx == 0:
+        cols = ["timestamp_ms", "recv_ts"]
+        for j in range(20):
+            cols.extend([f"bid_price_{j}", f"bid_qty_{j}", f"ask_price_{j}", f"ask_qty_{j}"])
+        return pd.DataFrame(columns=cols)
+
+    # Trim to actual size
+    result = {"timestamp_ms": snap_ts[:snap_idx], "recv_ts": snap_ts[:snap_idx]}
+    for j in range(20):
+        result[f"bid_price_{j}"] = snap_bids_p[:snap_idx, j]
+        result[f"bid_qty_{j}"] = snap_bids_q[:snap_idx, j]
+        result[f"ask_price_{j}"] = snap_asks_p[:snap_idx, j]
+        result[f"ask_qty_{j}"] = snap_asks_q[:snap_idx, j]
+
+    return pd.DataFrame(result)
+
+
 def _save_parquet(df: pd.DataFrame, date_str: str, stream: str) -> int:
     out_path = OUTPUT_DIR / date_str / stream / "full_day.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +464,9 @@ def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
     if out_path.exists():
         return "skip", 0, 0
 
-    result = _tardis_download_csv(ds["exchange"], ds["data_type"], date_str)
+    symbol = ds.get("symbol")  # None for Binance (uses global SYMBOL)
+    result = _tardis_download_csv(ds["exchange"], ds["data_type"], date_str,
+                                  symbol=symbol)
     if result is None:
         return "404", 0, 0
     df, dl_bytes = result
@@ -302,12 +474,19 @@ def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
     if len(df) == 0:
         return "empty", 0, 0
 
+    post = ds.get("post_process")
+
+    # Incremental L2 needs raw data before column mapping
+    if post == "incremental_book_l2":
+        df = _process_incremental_book_l2(df)
+        file_size = _save_parquet(df, date_str, ds["output_stream"])
+        return "done", len(df), dl_bytes
+
     if "column_map" in ds:
         df = _apply_column_map(df, ds["column_map"])
 
     df = _convert_timestamps(df)
 
-    post = ds.get("post_process")
     if post == "trades":
         df = _process_trades(df)
     elif post == "book_snapshot":
@@ -355,19 +534,30 @@ def download_binance_metrics_job(date_str: str) -> tuple[str, int, int]:
 # Job creation
 # ---------------------------------------------------------------------------
 
-def create_jobs(start_date: datetime, end_date: datetime) -> list[tuple]:
+CROSS_EXCHANGE_DATASETS = ["cb_quotes", "cb_trades", "cb_book_l2",
+                           "bb_quotes", "bb_trades", "bb_book25"]
+
+
+def create_jobs(start_date: datetime, end_date: datetime,
+                cross_only: bool = False) -> list[tuple]:
     """Create list of (source, dataset_name, date_str) jobs."""
     jobs = []
     current = start_date
+
+    if cross_only:
+        ds_list = CROSS_EXCHANGE_DATASETS
+    else:
+        ds_list = list(TARDIS_DATASETS.keys())
+
     while current < end_date:
         date_str = current.strftime("%Y-%m-%d")
 
-        # 8 Tardis datasets
-        for ds_name in TARDIS_DATASETS:
+        for ds_name in ds_list:
             jobs.append(("tardis", ds_name, date_str))
 
-        # 1 Binance DV metrics
-        jobs.append(("binance", "metrics", date_str))
+        # Binance DV metrics (skip if cross_only)
+        if not cross_only:
+            jobs.append(("binance", "metrics", date_str))
 
         current += timedelta(days=1)
     return jobs
@@ -401,6 +591,13 @@ EXPECTED_SCHEMAS = {
     "mark_price":          {"min_cols": 5, "required": ["timestamp_ms", "mark_price", "funding_rate"]},
     "liquidations":        {"min_cols": 3, "required": ["timestamp_ms", "price"]},
     "metrics":             {"min_cols": 6, "required": ["create_time"]},
+    # Cross-exchange
+    "coinbase_quotes":     {"min_cols": 5, "required": ["timestamp_ms", "best_bid_price"]},
+    "coinbase_trades":     {"min_cols": 5, "required": ["timestamp_ms", "price", "qty"]},
+    "coinbase_book_l2":    {"min_cols": 80, "required": ["timestamp_ms", "bid_price_0", "ask_price_0"]},
+    "bybit_quotes":        {"min_cols": 5, "required": ["timestamp_ms", "best_bid_price"]},
+    "bybit_trades":        {"min_cols": 5, "required": ["timestamp_ms", "price", "qty"]},
+    "bybit_orderbook":     {"min_cols": 80, "required": ["timestamp_ms", "bid_price_0", "ask_price_0"]},
 }
 
 
@@ -548,6 +745,8 @@ Examples:
                         help="Validate downloaded data only")
     parser.add_argument("--status", action="store_true",
                         help="Show download status only")
+    parser.add_argument("--cross-only", action="store_true",
+                        help="Download only cross-exchange data (Coinbase + Bybit)")
     args = parser.parse_args()
 
     # Date range
@@ -582,12 +781,17 @@ Examples:
         return
 
     # Create jobs
-    all_jobs = create_jobs(start_date, end_date)
+    cross_only = getattr(args, 'cross_only', False)
+    all_jobs = create_jobs(start_date, end_date, cross_only=cross_only)
     total_days = (end_date - start_date).days
+
+    mode = "CROSS-EXCHANGE ONLY (Coinbase + Bybit)" if cross_only else "ALL"
+    n_ds = len(CROSS_EXCHANGE_DATASETS) if cross_only else len(TARDIS_DATASETS) + 1
 
     print(f"{'='*60}")
     print(f"  Download: {start_date.date()} to {end_date.date()} ({total_days} days)")
-    print(f"  Datasets: 8 Tardis + 1 Binance DV = 9 per day")
+    print(f"  Mode: {mode}")
+    print(f"  Datasets: {n_ds} per day")
     print(f"  Total jobs: {len(all_jobs)}")
     print(f"  Workers: {args.workers}")
     print(f"  Output: {OUTPUT_DIR}")
