@@ -1,0 +1,811 @@
+================================================================================
+PREDICTXGBOOST v3.1 - DOCUMENTO DE DISENO
+================================================================================
+Fecha: 2026-03-12
+Autor: Mariano + Claude
+
+================================================================================
+1. OBJETIVO
+================================================================================
+
+Predecir la probabilidad de que un bloque de 5 minutos de BTCUSDT cierre
+UP (close >= open) en los mercados de Polymarket.
+
+  Input:  estado actual del mercado + historia del bloque + bloques previos
+  Output: P(Up) = probabilidad calibrada entre 0 y 1
+
+El sistema opera en DOS CAPAS:
+
+  Capa 1 - Modelo de fair probability:
+    Solo datos Binance → P(Up) calibrada
+
+  Capa 2 - Motor de ejecucion:
+    P(Up) + orderbook Polymarket → comprar YES, comprar NO, o no operar
+
+NO gana el que acierta direccion. Gana el que compra por debajo de su
+probabilidad estimada y vende por encima.
+
+================================================================================
+2. MERCADO DE POLYMARKET - COMO FUNCIONA
+================================================================================
+
+Cada 5 minutos hay un mercado nuevo de "BTC Up or Down":
+  - Bloques fijos: 14:00:00, 14:05:00, 14:10:00, ...
+  - block_start = floor(timestamp / 300) * 300  (multiplos de 300s UTC)
+  - block_end   = block_start + 300
+
+Resolucion:
+  - Se fija precio de apertura (open_ref) al inicio del bloque
+  - Se mira precio de cierre (close_ref) al final
+  - Si close_ref >= open_ref → UP gana (shares YES pagan $1)
+  - Si close_ref <  open_ref → DOWN gana (shares NO pagan $1)
+
+Fuente de precio: Chainlink BTC/USD data stream.
+
+Shares:
+  - Se compran entre $0.00 y $1.00
+  - Si acertas, pagan $1.00
+  - Fee: variable por mercado. Algunos son fee-free, otros tienen taker
+    fees. Verificar en la documentacion de cada mercado antes de operar.
+
+================================================================================
+3. SERIE CANONICA DE REFERENCIA (ref_price)
+================================================================================
+
+*** CRITICO: todo lo que se compara con open_ref debe usar la misma serie ***
+
+El target resuelve por Chainlink. Como proxy usamos Binance index_price
+(promedio ponderado de spot de varios exchanges, lo mas parecido a
+Chainlink que tenemos).
+
+Construccion de ref_price_1s:
+  1. Tomar index_price del stream mark_price (cada 1-3 segundos)
+  2. Forward-fill a 1 segundo (usar ultimo valor disponible)
+  3. NUNCA interpolar hacia adelante (no usar valores futuros)
+  4. Validar: si no hay index_price en >5s, marcar como stale
+
+Fallback (si index_price no disponible):
+  ref_price = 0.7 * spot_mid + 0.3 * futures_mid
+
+REGLA: las features del Grupo A (estado del bloque) usan SIEMPRE
+ref_price, NO futures mid. Las features de microestructura (Grupo B)
+sí usan futures mid y spot mid por separado.
+
+Si se usa futures mid para dist_to_open, el modelo aprende sobre el
+basis (diferencia futures-spot), no sobre el evento que realmente
+liquida Polymarket. Eso es un error conceptual que invalida resultados.
+
+Evolucion futura: reetiquetado con Chainlink real (Fase 4).
+
+================================================================================
+4. TARGET (lo que predecimos)
+================================================================================
+
+Para cada bloque de 5 minutos:
+
+  block_start  = floor(T / 300_000) * 300_000   (epoch ms)
+  block_end    = block_start + 300_000
+
+  open_ref  = ultimo ref_price ANTES O IGUAL a block_start
+  close_ref = ultimo ref_price ANTES O IGUAL a block_end
+
+  *** NUNCA usar "nearest" ni "first after". Solo "last before or at". ***
+  Con markPrice@1s, un solo segundo de adelanto ya es look-ahead en
+  el evento entero.
+
+  target = 1  si close_ref >= open_ref   (UP)
+  target = 0  si close_ref <  open_ref   (DOWN)
+
+Target auxiliar (para analisis, no para el modelo):
+  terminal_return_bps = (close_ref - open_ref) / open_ref * 10000
+
+IMPORTANTE: todas las filas del mismo bloque comparten el MISMO target.
+Esto implica que en train/val NUNCA se puede partir un bloque entre ambos.
+
+================================================================================
+5. ESTRUCTURA DEL DATASET
+================================================================================
+
+Una fila cada 5 segundos dentro de cada bloque activo.
+
+  288 bloques/dia * 60 filas/bloque = ~17,280 filas por dia
+  120 dias = ~2,073,600 filas
+
+Cada fila contiene:
+
+  Identificacion:
+    block_start_ms    inicio del bloque (epoch ms)
+    timestamp_ms      momento T de esta observacion
+    seconds_to_expiry cuanto falta para block_end
+
+  Target:
+    target            1=Up, 0=Down
+    terminal_return   close_ref - open_ref en bps (auxiliar)
+
+  Features:           ~85 features (ver seccion 6)
+
+MUESTREO: cada 5 segundos uniforme para V1.
+
+OVERLAP ENTRE DIAS:
+  Los daily shards necesitan leer datos extra de dias adyacentes:
+  - 30 minutos del dia anterior (para prev_blocks, prev_15m_vol del
+    primer bloque del dia)
+  - 5 minutos del dia siguiente (para close_ref del ultimo bloque)
+  Crypto no tiene sesion. Si se procesa el dia aislado, los bordes
+  quedan mal.
+
+================================================================================
+6. FEATURES - DETALLE COMPLETO (~85 features)
+================================================================================
+
+REGLA FUNDAMENTAL: ningun feature contiene precio, volumen o cantidad
+absoluta. Todo es: porcentajes, ratios, z-scores, bps, o flags.
+
+REGLA ANTI-LEAKAGE EN NORMALIZADORES:
+  Todo z-score, percentil, media y std de referencia se calcula SOLO
+  con datos del pasado. Nunca calcular percentiles con el dia/mes entero
+  y aplicarlos a filas tempranas.
+  Prohibido: rolling(center=True), joins con nearest, forward fill que
+  cruce limites de bloque.
+
+--------------------------------------------------------------------------------
+GRUPO A: ESTADO DEL BLOQUE ACTUAL (~15 features) *** LAS MAS IMPORTANTES ***
+--------------------------------------------------------------------------------
+Fuente: ref_price_1s (serie canonica, NO futures mid)
+
+Estas features resumen el estado del bloque activo en el momento T.
+
+  seconds_to_expiry            block_end - T en segundos (300 a 0)
+  dist_to_open_bps             (ref_price_now - open_ref) / open_ref * 10000
+  max_runup_since_open_bps     max(ref_price - open_ref) / open_ref * 10000
+  max_drawdown_since_open_bps  min(ref_price - open_ref) / open_ref * 10000
+  range_since_open_bps         max_runup - max_drawdown
+  pct_time_above_open          fraccion del bloque con ref_price >= open_ref
+  pct_time_above_open_last_30s idem pero solo los ultimos 30s (mas reactiva)
+  num_crosses_open             cuantas veces ref_price cruzo open_ref
+  last_cross_age_s             segundos desde el ultimo cruce del open_ref
+  current_position_in_range    (ref_now - min) / (max - min) dentro del bloque
+  realized_vol_since_open      std(returns 1s de ref_price) desde block_start
+  realized_vol_10s             std(returns ref_price) ultimos 10 segundos
+  realized_vol_30s             idem 30s
+  realized_vol_60s             idem 60s
+
+  *** FEATURE CLAVE ***
+  dist_to_open_z               dist_to_open_bps / (sigma_recent * sqrt(seconds_to_expiry))
+                               Resume: cuanto colchon tiene el precio vs el ruido
+                               esperado hasta el cierre. Un solo numero que combina
+                               posicion + volatilidad + tiempo restante.
+                               sigma_recent = realized_vol_60s (o since_open si < 60s)
+
+Subtotal: 15 features
+
+NOTA: se eliminaron vs V3.0:
+  - elapsed_frac (redundante con seconds_to_expiry)
+  - dist_to_open_sign (el modelo lo infiere de dist_to_open_bps)
+  - return_since_open (= dist_to_open_bps)
+  - vol_ratio_recent_vs_open (poco valor vs las vol individuales)
+Se agregaron:
+  - pct_time_above_open_last_30s (mas reactiva que solo acumulada)
+  - last_cross_age_s (cuanto hace que cruzo, muy informativa)
+
+--------------------------------------------------------------------------------
+GRUPO B: MICROESTRUCTURA RECIENTE (~37 features)
+--------------------------------------------------------------------------------
+Fuente: bookticker, orderbook, trades (spot + futures)
+Ventanas: 5s, 10s, 30s, 60s
+
+NOTA: estas features usan futures mid y spot mid directamente (NO ref_price).
+Es correcto porque miden microestructura del mercado, no posicion vs open.
+
+Book snapshot (ultimo disponible):
+  spot_spread_bps              (ask - bid) / mid * 10000
+  fut_spread_bps               idem futures
+  spot_imbalance_L1            (bid_qty - ask_qty) / (bid_qty + ask_qty) nivel 1
+  spot_imbalance_L5            idem top 5 niveles
+  fut_imbalance_L1             idem futures nivel 1
+  fut_imbalance_L5             idem futures top 5 niveles
+
+Cross-market:
+  basis_bps                    (fut_mid - spot_mid) / spot_mid * 10000
+  basis_delta_5s               cambio de basis en 5s
+  basis_delta_10s              cambio de basis en 10s
+  basis_delta_30s              cambio de basis en 30s
+
+Trade flow (ventanas 5s/10s/30s/60s):
+  spot_buy_pct_5s              % volumen taker buy en spot, ultimos 5s
+  spot_buy_pct_10s
+  spot_buy_pct_30s
+  spot_buy_pct_60s
+  fut_buy_pct_5s               % volumen taker buy en futures, ultimos 5s
+  fut_buy_pct_10s
+  fut_buy_pct_30s
+  fut_buy_pct_60s
+
+  NOTA sobre aggTrade: spot agrega por orden taker, futures agrega fills
+  con mismo precio/lado cada 100ms. Por lo tanto NO hacer ratios de
+  conteo entre mercados (trade_count spot / trade_count fut). Si usar
+  buy_pct, signed volume y returns relativos entre mercados.
+
+Volumen firmado normalizado (z-score SOLO con datos pasados):
+  spot_signed_vol_z_10s        signed_vol_10s / std(signed_vol_60s)
+  spot_signed_vol_z_30s
+  fut_signed_vol_z_10s
+  fut_signed_vol_z_30s
+
+Intensidad de trading:
+  fut_trade_intensity_5s       trades/segundo en ventana
+  fut_trade_intensity_10s
+  fut_trade_intensity_30s
+  spot_trade_intensity_5s
+  spot_trade_intensity_10s
+  spot_trade_intensity_30s
+
+Price returns (de ref_price):
+  return_5s                    return en bps, ultimos 5s
+  return_10s
+  return_30s
+  return_60s
+
+VWAP del bloque:
+  price_vs_block_vwap_bps      (ref_now - block_vwap) / block_vwap * 10000
+  block_vwap_vs_open_bps       (block_vwap - open_ref) / open_ref * 10000
+
+Drift:
+  recent_drift_vs_block_drift  slope ultimos 30s vs slope desde apertura
+
+Subtotal: 37 features
+
+--------------------------------------------------------------------------------
+GRUPO C: CONTEXTO DE REGIMEN (~12 features)
+--------------------------------------------------------------------------------
+Fuentes:
+  - mark_price stream: funding_rate, index_price, mark_price
+  - Endpoint separado: open interest (NO viene en mark_price stream)
+  - metrics parquet: long_short_ratio, top_trader, taker ratio
+
+*** REGLA ANTI-LEAKAGE PARA FEATURES LENTAS ***
+Las metricas de periodo 5m (OI, long_short, taker ratio) se publican
+al CIERRE del periodo. Para una fila en 12:03:25, NO usar la barra
+12:00-12:05. Solo usar la ULTIMA BARRA CERRADA antes de T.
+Implementar con lag de 1 barra completa como minimo.
+
+  funding_rate                 tasa de financiacion actual (de mark_price)
+  minutes_to_funding           minutos hasta proximo funding (cada 8h)
+  mark_vs_index_bps            (mark_price - index_price) / index_price * 10000
+  oi_change_pct_5m             cambio % de open interest (BARRA CERRADA -1)
+  long_short_ratio             ratio global long/short (BARRA CERRADA -1)
+  long_short_change            cambio del ratio vs barra anterior
+  top_trader_long_short        ratio long/short top traders (BARRA CERRADA -1)
+  taker_long_short_vol_ratio   ratio volumen taker (BARRA CERRADA -1)
+
+Liquidaciones (como FLAG de estres, no medicion precisa):
+  forceOrder solo publica la ultima liquidacion por ventana de 1000ms.
+  En cascadas rapidas no se ve el flujo completo. Usar como señal de
+  estres, no como medicion de intensidad.
+
+  liq_any_5m                   1 si hubo al menos 1 liquidacion en 5m
+  liq_any_30s                  1 si hubo al menos 1 liquidacion en 30s
+  liq_burst_flag               1 si multiples liquidaciones en 10s
+  liq_last_side                1=buy, -1=sell, 0=none (ultima liquidacion)
+
+Subtotal: 12 features
+
+--------------------------------------------------------------------------------
+GRUPO D: HISTORIA DE BLOQUES (~10 features)
+--------------------------------------------------------------------------------
+Fuente: resultados de bloques anteriores cerrados
+
+Solo 3 bloques explicitos + agregados de 6 bloques.
+No usar 5 bloques explicitos: demasiada redundancia, riesgo de
+sobreajuste en patrones de rachas que en BTC a 5m son debiles.
+
+Explicitos (ultimos 3 cerrados):
+  prev_1_return_bps            return del bloque -1
+  prev_2_return_bps            return del bloque -2
+  prev_3_return_bps            return del bloque -3
+  prev_1_result                1=Up, 0=Down del bloque -1
+
+Agregados (ultimos 6 bloques = 30 min):
+  up_pct_last_6                que % de los ultimos 6 bloques fueron Up
+  mean_return_last_6           return promedio ultimos 6 bloques
+  vol_last_6                   std(returns) ultimos 6 bloques
+  max_abs_return_last_6        max(abs(return)) ultimos 6 bloques
+
+Regimen de volatilidad:
+  prev_15m_realized_vol        vol realizada ultimos 15 minutos (de ref_price)
+  prev_30m_realized_vol        vol realizada ultimos 30 minutos (opcional, evaluar)
+
+Subtotal: 10 features
+
+NOTA: se eliminaron vs V3.0:
+  - prev_4_return_bps, prev_5_return_bps (redundante con agregados)
+  - prev_2_result, prev_3_result (ruido)
+  - streak_count, streak_direction (sobreajuste en rachas debiles)
+  - prev_5_up_pct → reemplazado por up_pct_last_6
+
+--------------------------------------------------------------------------------
+GRUPO E: TEMPORAL (~6 features)
+--------------------------------------------------------------------------------
+Fuente: timestamp
+
+  hour_sin                     sin(2*pi*hour/24)
+  hour_cos                     cos(2*pi*hour/24)
+  dow_sin                      sin(2*pi*dow/7)
+  dow_cos                      cos(2*pi*dow/7)
+  minutes_to_funding           minutos hasta proximo funding (cada 8h)
+  is_us_market_hours           1 si 13:30-20:00 UTC (9:30-16:00 EST)
+
+NOTA: minutes_to_funding aparece aqui pero se calcula del mark_price
+stream. No duplicar con Grupo C.
+
+Subtotal: 6 features
+
+--------------------------------------------------------------------------------
+GRUPO F: CALIDAD DEL DATO (~7 features)
+--------------------------------------------------------------------------------
+Fuente: timestamps de cada stream
+
+  age_bookticker_ms            T - timestamp del ultimo bookticker futures
+  age_markprice_ms             T - timestamp del ultimo mark_price
+  age_depth_ms                 T - timestamp del ultimo orderbook
+  age_trades_ms                T - timestamp del ultimo trade
+  missing_stream_count         cuantos streams no tienen dato reciente (<5s)
+  open_ref_quality_flag        1 si open_ref se calculo con dato fresco (<3s)
+  core_streams_fresh_flag      1 si ref_price, bookticker y trades estan frescos
+
+Estas features son criticas en produccion: evitan operar con datos viejos.
+
+Subtotal: 7 features
+
+--------------------------------------------------------------------------------
+TOTAL: ~87 features
+--------------------------------------------------------------------------------
+
+Distribucion:
+  Grupo A (bloque):          15 features  ← centro del modelo
+  Grupo B (microestructura): 37 features
+  Grupo C (regimen):         12 features
+  Grupo D (historia):        10 features
+  Grupo E (temporal):         6 features
+  Grupo F (calidad):          7 features
+
+Despues del primer entrenamiento, se podan las features con importancia
+cercana a cero. Objetivo: quedarse con 55-70 features utiles.
+
+================================================================================
+7. CHECKS DE SANIDAD PRE-ENTRENAMIENTO
+================================================================================
+
+Antes de entrenar, ejecutar estos checks sobre el dataset generado:
+
+1. TIMESTAMPS:
+   - Todos los streams estan en milisegundos (13 digitos, ~1.7 trillion)
+   - No hay mezcla microsegundos/milisegundos entre spot y futures
+   - Timestamps son monotonicos crecientes por stream
+
+2. OPEN_REF:
+   - open_ref usa ref_price (index_price), NO futures mid
+   - open_ref es el ultimo valor ANTES O IGUAL a block_start
+   - close_ref es el ultimo valor ANTES O IGUAL a block_end
+   - NUNCA "nearest" ni "first after"
+
+3. LEAKAGE EN FEATURES LENTAS:
+   - oi_change_pct usa barra cerrada -1, no la barra actual
+   - long_short_ratio usa barra cerrada -1
+   - taker ratio usa barra cerrada -1
+   - Verificar: para una fila en T, ninguna feature de metrics usa
+     datos con timestamp > T
+
+4. LEAKAGE EN Z-SCORES:
+   - Ningun z-score usa media/std calculada con datos futuros
+   - Ningun rolling usa center=True
+   - signed_vol_z usa std de 60s PREVIOS, no del dia entero
+
+5. BLOQUE INTEGRIDAD:
+   - Todas las filas del mismo block_start tienen el mismo target
+   - No hay bloques partidos entre train y val
+   - Embargo de 10 min entre train y val
+
+6. OVERLAP ENTRE DIAS:
+   - Primer bloque del dia tiene prev_blocks correctos (del dia anterior)
+   - Ultimo bloque del dia tiene close_ref correcto (puede caer en dia siguiente)
+
+================================================================================
+8. MODELO
+================================================================================
+
+--------------------------------------------------------------------------------
+8A. BASELINES OBLIGATORIAS (antes de LightGBM)
+--------------------------------------------------------------------------------
+
+Baseline 1 - Tonta:
+  predict Up si ref_price_now >= open_ref
+  Gratis, sin modelo. Si LightGBM no le gana, no hay edge.
+
+Baseline 2 - Browniana:
+  p_bm = Phi(dist_to_open / (sigma * sqrt(time_left)))
+  Phi = CDF normal estandar
+  sigma = realized_vol_since_open (o 60s)
+  Formula matematica, sin entrenamiento.
+
+Ambas baselines se evaluan en cada fold de walk-forward y se comparan
+con LightGBM. Si LightGBM no mejora de forma significativa sobre ambas,
+no hay edge real y no se pasa a produccion.
+
+--------------------------------------------------------------------------------
+8B. LIGHTGBM BINARIO
+--------------------------------------------------------------------------------
+
+Parametros iniciales:
+  objective:         binary
+  metric:            binary_logloss
+  boosting_type:     gbdt
+  num_leaves:        63
+  learning_rate:     0.03
+  n_estimators:      3000 (con early stopping 200)
+  min_child_samples: 300
+  subsample:         0.8
+  colsample_bytree:  0.7
+  reg_alpha:         0.1
+  reg_lambda:        1.0
+  max_bin:           255
+  seed:              42
+
+Sample weights:
+  NO usar class weights en V1.
+  Up/Down deberia estar cerca de 50/50. Weights innecesarios pueden
+  empeorar la calibracion de probabilidad, que es lo que mas importa.
+  Solo agregar weights si hay desbalance real y consistente (>55/45)
+  que perjudique en validacion.
+
+--------------------------------------------------------------------------------
+8C. CALIBRACION
+--------------------------------------------------------------------------------
+
+La probabilidad cruda de LightGBM no esta bien calibrada.
+Cuando dice P=0.70, puede que realmente acierte 0.65 o 0.75.
+
+Calibracion isotonica, SEPARADA por bucket de tiempo restante:
+
+  Bucket 1: 240-300s (inicio del bloque, maxima incertidumbre)
+  Bucket 2: 180-240s
+  Bucket 3: 120-180s
+  Bucket 4: 60-120s
+  Bucket 5: 30-60s
+  Bucket 6: 0-30s   (final del bloque, minima incertidumbre)
+
+La misma probabilidad bruta no significa lo mismo faltando 250s que
+faltando 10s. Un P=0.60 al inicio es muy incierto; un P=0.60 faltando
+5 segundos es casi definitivo.
+
+*** ANTI-LEAKAGE EN CALIBRACION ***
+El calibrador NO se entrena con el mismo set usado para:
+  - early stopping
+  - elegir numero de arboles
+  - comparar variantes
+
+Opciones correctas:
+  1. Split interno: train → modelo, calib_set → calibrador, val → evaluacion
+     (ej: 70% train, 15% calib, 15% val del periodo de train)
+  2. Out-of-fold predictions sobre train, calibrador encima de esos OOF
+
+Para un modelo de probabilidad, esto importa mucho.
+
+================================================================================
+9. ENTRENAMIENTO Y VALIDACION
+================================================================================
+
+--------------------------------------------------------------------------------
+9A. WALK-FORWARD TEMPORAL
+--------------------------------------------------------------------------------
+
+  Train:    8 semanas (56 dias)
+  Val:      2 semanas (14 dias)
+  Step:     1 semana (7 dias)
+
+Reglas duras:
+  1. GROUP POR block_start: todas las filas del mismo bloque van juntas.
+     Nunca mitad en train y mitad en val.
+  2. EMBARGO de 10 minutos (2 bloques) alrededor de cada corte train/val.
+     Se descartan los bloques dentro de los 10 min anteriores y
+     posteriores al punto de corte.
+  3. Orden temporal estricto: train siempre ANTES de val.
+
+Split interno del train:
+  - 85% para entrenar LightGBM
+  - 15% para calibracion (ultimo 15% temporal del train)
+  El val set solo se usa para early stopping y evaluacion final del fold.
+
+Holdout final:
+  Ultimas 2 semanas del dataset. NUNCA se usan para entrenar ni calibrar.
+  Solo se evaluan una vez al final como test definitivo.
+
+--------------------------------------------------------------------------------
+9B. REPORTE POR FOLD
+--------------------------------------------------------------------------------
+
+Cada fold imprime:
+
+  1. METRICAS GENERALES:
+     - Accuracy
+     - Log loss (binary)
+     - Brier score
+     - AUC (ROC)
+     - F1
+
+  2. COMPARACION VS BASELINES:
+     Metrica          Baseline_tonta  Baseline_BM  LightGBM  Delta_vs_tonta  Delta_vs_BM
+     accuracy         XX.X%           XX.X%        XX.X%     +X.X%           +X.X%
+     logloss          X.XXXX          X.XXXX       X.XXXX    -X.XXXX         -X.XXXX
+
+     Si Delta_vs_BM no es positivo, el modelo no tiene edge real.
+
+  3. METRICAS POR FASE DEL BLOQUE:
+     Fase             Filas    Accuracy  Logloss   AUC    vs_BM
+     240-300s (early) XX,XXX   XX.X%     X.XXXX    X.XX   +X.X%
+     120-240s (mid)   XX,XXX   XX.X%     X.XXXX    X.XX   +X.X%
+     0-120s (late)    XX,XXX   XX.X%     X.XXXX    X.XX   +X.X%
+
+     Si el modelo solo gana en 0-120s, el edge esta en los ultimos
+     segundos (facil de predecir pero probablemente ya priceado en
+     Polymarket). El edge real esta en el early/mid.
+
+  4. CALIBRACION:
+     P(pred)    Filas    Freq_real_Up  Ratio(real/pred)
+     50-55%     XX,XXX   XX.X%         X.XX
+     55-60%     XX,XXX   XX.X%         X.XX
+     60-65%     XX,XXX   XX.X%         X.XX
+     65-70%     XX,XXX   XX.X%         X.XX
+     70-80%     XX,XXX   XX.X%         X.XX
+     80-90%     XX,XXX   XX.X%         X.XX
+     90-100%    XX,XXX   XX.X%         X.XX
+
+     ECE (Expected Calibration Error): X.XXXX
+     Si ratio ≈ 1.0 en todos los buckets → bien calibrado.
+
+  5. FEATURE IMPORTANCE:
+     Top 30 features (por split count):
+       1. feature_name                    XX,XXX splits
+       2. ...
+
+     Bottom 30 features (candidatas a eliminar):
+       85. feature_name                   XX splits
+       86. ...
+
+     Features con importancia = 0: XX de 87
+
+     Importancia por grupo:
+       Bloque:   XX.X% | Micro: XX.X% | Regimen: XX.X%
+       Historia: XX.X% | Temporal: XX.X% | Calidad: XX.X%
+
+  6. PSEUDO-PNL DE FORECASTING:
+     *** NOTA: esto NO es PnL real de estrategia. Es diagnostico de
+     conviccion del modelo. PnL real requiere Polymarket orderbook. ***
+
+     Solo opera cuando |P(Up) - 0.5| > threshold:
+     Threshold  Trades  Win_rate  Avg_profit_bps  Sharpe  MaxDD_bps
+     0.05       XX,XXX  XX.X%     X.XX            X.XX    -XX.X
+     0.10       XX,XXX  XX.X%     X.XX            X.XX    -XX.X
+     0.15       XX,XXX  XX.X%     X.XX            X.XX    -XX.X
+     0.20       XX,XXX  XX.X%     X.XX            X.XX    -XX.X
+
+  7. ANALISIS DE ERRORES:
+     - Accuracy bloques faciles (|terminal_return| > 10 bps): XX.X%
+     - Accuracy bloques dificiles (|terminal_return| < 2 bps): XX.X%
+     - Accuracy alta volatilidad (vol_since_open > P75): XX.X%
+     - Accuracy baja volatilidad (vol_since_open < P25): XX.X%
+
+  8. ESTABILIDAD INTRA-BLOQUE:
+     - Avg flips por bloque (cuantas veces cambia de pred dentro del bloque)
+     - % bloques con prediccion estable (misma pred >80% del bloque)
+     Un modelo con buen logloss pero que flippea 7 veces por bloque
+     es peor para operar que uno algo peor pero estable.
+
+--------------------------------------------------------------------------------
+9C. RESUMEN WALK-FORWARD
+--------------------------------------------------------------------------------
+
+Al final de todos los folds:
+
+  Metrica           Mean     Std      Min      Max
+  accuracy          XX.X%    X.X%     XX.X%    XX.X%
+  logloss           X.XXXX   X.XXXX   X.XXXX   X.XXXX
+  brier             X.XXXX   X.XXXX   X.XXXX   X.XXXX
+  AUC               X.XXXX   X.XXXX   X.XXXX   X.XXXX
+  ECE               X.XXXX   X.XXXX   X.XXXX   X.XXXX
+  delta_vs_BM_acc   +X.X%    X.X%     +X.X%    +X.X%
+  delta_vs_BM_ll    -X.XXXX  X.XXXX   -X.XXXX  -X.XXXX
+
+  Consistency: LightGBM > Baseline BM en X de Y folds
+  Si consistency < 100%, investigar que regimen de mercado causo el fallo.
+
+================================================================================
+10. INFERENCIA EN PRODUCCION
+================================================================================
+
+--------------------------------------------------------------------------------
+10A. DATOS EN MEMORIA
+--------------------------------------------------------------------------------
+
+Ring buffers en RAM (~50-100 MB):
+
+  Stream                      Retener     Uso
+  --------------------------  ----------  ----------------------------------
+  ref_price_1s (index_price)  20 min      open_ref, dist_to_open, vol, VWAP
+  bookticker futures          60s         spread futures, microestructura
+  bookticker spot             60s         spread spot, basis
+  trades futures              60s         trade flow, intensity, buy_pct
+  trades spot                 60s         idem spot
+  orderbook futures           ultimo snap imbalance L1/L5
+  orderbook spot              ultimo snap imbalance L1/L5
+  mark_price                  ultimo snap funding, mark_vs_index
+  metrics                     ultimo snap long_short, taker ratio (barra cerrada)
+  block_history               6 ultimos   prev returns, up_pct, vol
+
+--------------------------------------------------------------------------------
+10B. CICLO DE INFERENCIA
+--------------------------------------------------------------------------------
+
+Cada 5 segundos:
+
+  1. Detectar bloque activo:
+     block_start = floor(now / 300_000) * 300_000
+     block_end   = block_start + 300_000
+
+  2. Si es bloque nuevo → fijar open_ref = ultimo ref_price <= block_start
+
+  3. Calcular ~87 features desde ring buffers
+
+  4. LightGBM predice: P_raw(Up)
+
+  5. Calibrar por seconds_to_expiry bucket → P_cal(Up)
+
+  6. Calcular metricas de decision:
+     confidence = abs(P_cal - 0.5)
+     uncertainty = -P_cal * log(P_cal) - (1-P_cal) * log(1-P_cal)
+     data_quality_score = basado en age de cada stream
+
+  7. Leer Polymarket orderbook:
+     ask_yes = precio de comprar YES (Up)
+     ask_no  = precio de comprar NO (Down)
+
+  8. Calcular edge:
+     edge_yes = P_cal - ask_yes - fees - slippage_buffer
+     edge_no  = (1 - P_cal) - ask_no - fees - slippage_buffer
+
+  9. Decidir:
+     Si edge_yes > min_edge Y data_quality OK → COMPRAR YES
+     Si edge_no  > min_edge Y data_quality OK → COMPRAR NO
+     Sino → NO OPERAR
+
+--------------------------------------------------------------------------------
+10C. HARD FILTERS (no operar si)
+--------------------------------------------------------------------------------
+
+  - age_bookticker_ms > 3000      (dato de precio viejo)
+  - age_markprice_ms > 10000      (mark price viejo)
+  - missing_stream_count > 1      (multiples streams caidos)
+  - spread Polymarket > 0.10      (mercado iliquido)
+  - depth Polymarket < min_depth  (no hay con quien operar)
+  - seconds_to_expiry < 10        (muy cerca del cierre, riesgo de no fill)
+  - confidence < 0.05             (modelo no esta seguro)
+  - open_ref_quality_flag == 0    (open_ref calculado con dato stale)
+
+--------------------------------------------------------------------------------
+10D. OUTPUT DE INFERENCIA
+--------------------------------------------------------------------------------
+
+Cada tick de decision genera:
+
+  {
+    "block_start":       1773249300000,
+    "timestamp":         1773249330000,
+    "seconds_to_expiry": 270,
+    "open_ref":          84521.50,
+    "price_now":         84525.30,
+    "dist_to_open_bps":  4.49,
+    "p_up_raw":          0.68,
+    "p_up_calibrated":   0.71,
+    "confidence":        0.21,
+    "uncertainty":       0.87,
+    "data_quality":      1.0,
+    "ask_yes":           0.58,
+    "ask_no":            0.44,
+    "edge_yes":          0.11,
+    "edge_no":           -0.17,
+    "action":            "BUY_YES",
+    "filters_passed":    true
+  }
+
+================================================================================
+11. PIPELINE DE EJECUCION
+================================================================================
+
+Paso 1: build_dataset_v3.py
+  - Lee parquets raw de data/raw/ (ya descargados)
+  - Construye ref_price_1s desde index_price del mark_price stream
+  - Identifica bloques de 5 min (block_start = multiplos de 300s)
+  - Genera 1 fila cada 5s por bloque (60 filas/bloque)
+  - Calcula open_ref como ultimo ref_price <= block_start
+  - Calcula close_ref como ultimo ref_price <= block_end
+  - Calcula target y terminal_return
+  - Calcula ~87 features por fila
+  - Guarda en data/dataset_v3/YYYY-MM-DD.parquet
+  - Carga 30 min del dia anterior + 5 min del dia siguiente para bordes
+  - ~2 horas en EC2 con 8 workers
+
+Paso 2: train_model_v3.py
+  - Carga dataset completo
+  - Calcula baselines (tonta + browniana) sobre todo el dataset
+  - Entrena LightGBM con walk-forward:
+    - Group por block_start
+    - Embargo 10 min
+    - Split interno: 85% train, 15% calib
+  - Calibra probabilidades por bucket de tiempo
+  - Genera reporte completo por fold + resumen
+  - Guarda modelo en models/lightgbm_v3.txt
+  - Guarda calibradores en models/calibrators_v3.pkl
+  - Guarda metricas en models/metrics_v3.json
+
+Paso 3 (futuro): live_predictor_v3.py
+  - Conecta WebSockets Binance (8 streams)
+  - Construye ref_price_1s en tiempo real
+  - Mantiene ring buffers
+  - Cada 5s calcula features + predice + calibra
+  - Conecta Polymarket API (orderbook)
+  - Ejecuta trades cuando hay edge
+
+================================================================================
+12. EVOLUCION FUTURA
+================================================================================
+
+Fase 1 (actual):
+  Modelo Binance-only de fair probability.
+  Validacion offline con walk-forward.
+
+Fase 2:
+  Captura de datos Polymarket:
+  - best bid/ask YES y NO
+  - spread, depth, imbalance del CLOB
+  - order flow reciente
+  - Via WebSocket canal "market" para updates en tiempo real
+  Backtest con datos reales de Polymarket.
+
+Fase 3:
+  Modelo hibrido:
+  - entrada = Binance fair probability + microestructura Polymarket
+  - salida = expected edge after costs
+  - CLOB de Polymarket usa limit orders marketable (no midpoint magico),
+    el backtest simula fill contra libro real.
+
+Fase 4:
+  Reetiquetado con Chainlink real.
+  El mercado resuelve por Chainlink, asi que el label final tiene que
+  venir del mismo stream que resuelve el contrato.
+
+================================================================================
+13. DATOS QUE YA TENEMOS vs DATOS NUEVOS
+================================================================================
+
+YA DESCARGADOS en EC2 (120 dias, 2025-11-11 a 2026-03-11):
+  - bookticker futures       ✓  (microestructura futures)
+  - bookticker spot          ✓  (microestructura spot, basis)
+  - trades futures           ✓  (trade flow, intensity)
+  - trades spot              ✓  (trade flow spot)
+  - orderbook futures        ✓  (imbalance L1/L5)
+  - orderbook spot           ✓  (imbalance L1/L5)
+  - mark_price               ✓  (index_price para ref_price, funding, mark)
+  - metrics                  ✓  (long_short, taker ratio, OI)
+  - liquidations             ✓  (liq flags)
+
+VERIFICADO: todos los timestamps estan en milisegundos (13 digitos).
+No hay mezcla de unidades entre spot y futures.
+
+NECESARIO PARA PRODUCCION (no para entrenar):
+  - Polymarket orderbook via WebSocket/REST
+  - Opcionalmente Chainlink data stream
+
+CONCLUSION: no necesitamos descargar nada nuevo para entrenar V3.
+Solo cambia como organizamos los datos en filas.
+
+================================================================================
