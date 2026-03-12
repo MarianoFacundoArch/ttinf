@@ -358,12 +358,12 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
         phase_results[label] = {"accuracy": acc_m, "logloss": ll_m, "auc": auc_m, "vs_bm_acc": acc_m - bm_acc}
 
     # --- 3b. Fine-grained accuracy (10s buckets) ---
-    print(f"\n  3b. FINE-GRAINED ACCURACY (10s buckets)")
+    print(f"\n  3b. FINE-GRAINED ACCURACY (5s buckets)")
     print(f"     {'Bucket':<12s} {'Rows':>8s} {'Acc':>8s} {'BM_Acc':>8s} {'vs_BM':>8s} {'ECE':>8s} {'AvgP':>8s} {'FreqUp':>8s}")
     fine_results = {}
     y_cal_fine = apply_calibrators(y_proba, seconds, calibrators) if calibrators else y_proba
-    for lo in range(0, 300, 10):
-        hi = lo + 10
+    for lo in range(0, 300, 5):
+        hi = lo + 5
         label = f"{lo}-{hi}s"
         mask = (seconds >= lo) & (seconds < hi)
         if mask.sum() < 10:
@@ -672,11 +672,11 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
                 print(f"  {label:<25s} {np.mean(accs):>8.4f} {np.mean(aucs):>8.4f} "
                       f"{np.mean(vs_bm):>+8.4f} {np.std(accs):>8.4f}")
 
-        # Fine-grained summary (10s buckets)
-        print(f"\n  FINE-GRAINED ACCURACY (10s buckets, averaged across {len(all_results)} folds)")
+        # Fine-grained summary (5s buckets)
+        print(f"\n  FINE-GRAINED ACCURACY (5s buckets, averaged across {len(all_results)} folds)")
         print(f"  {'Bucket':<12s} {'Acc':>8s} {'BM_Acc':>8s} {'vs_BM':>8s} {'ECE':>8s} {'Rows':>10s}")
-        for lo in range(0, 300, 10):
-            label = f"{lo}-{lo+10}s"
+        for lo in range(0, 300, 5):
+            label = f"{lo}-{lo+5}s"
             accs = [r["phase_results"]["_fine"][label]["accuracy"]
                     for r in all_results
                     if "_fine" in r.get("phase_results", {}) and label in r["phase_results"]["_fine"]]
