@@ -306,7 +306,7 @@ def _tardis_download_csv(exchange: str, data_type: str, date_str: str,
     url = f"{TARDIS_BASE}/{exchange}/{data_type}/{year}/{month}/{day}/{sym}.csv.gz"
     headers = {"Authorization": f"Bearer {TARDIS_API_KEY}"} if TARDIS_API_KEY else {}
 
-    resp = requests.get(url, headers=headers, timeout=180)
+    resp = requests.get(url, headers=headers, timeout=600)
     if resp.status_code == 404:
         return None
     resp.raise_for_status()
@@ -811,10 +811,14 @@ Examples:
             elif status == "done":
                 tracker.record("done", size_bytes=dl_bytes, label=label)
             elif status == "404":
+                sys.stdout.write(f"\r\033[K  ✗ {ds_name} {date_str}: 404 (not available)\n")
                 tracker.record("fail", msg=f"{ds_name} {date_str}: 404")
             elif status == "empty":
+                sys.stdout.write(f"\r\033[K  ✗ {ds_name} {date_str}: empty\n")
                 tracker.record("fail", msg=f"{ds_name} {date_str}: empty")
             elif status.startswith("error"):
+                err_msg = status.replace("error:", "")
+                sys.stdout.write(f"\r\033[K  ✗ {ds_name} {date_str}: {err_msg}\n")
                 tracker.record("fail", msg=f"{ds_name} {date_str}: {status}")
 
     tracker.summary()
