@@ -3,6 +3,7 @@ LivePredictor: loads model + calibrators, computes features from LiveBuffer,
 returns calibrated P(Up) prediction.
 """
 
+import json
 import pickle
 import numpy as np
 import lightgbm as lgb
@@ -14,14 +15,14 @@ from src.features.feature_engine_v3 import (
 )
 
 
-# Calibration time buckets (must match train_model_v3.py)
+# Calibration time buckets (must match train_model_v3.py TIME_BUCKETS)
 CALIB_BUCKETS = [
-    (240, 300, "240-300"),
-    (180, 240, "180-240"),
-    (120, 180, "120-180"),
-    (60, 120, "60-120"),
-    (30, 60, "30-60"),
-    (0, 30, "0-30"),
+    (240, 300, "240-300s (early)"),
+    (180, 240, "180-240s"),
+    (120, 180, "120-180s"),
+    (60, 120, "60-120s"),
+    (30, 60, "30-60s"),
+    (0, 30, "0-30s (late)"),
 ]
 
 
@@ -40,6 +41,15 @@ class LivePredictor:
         with open(cols_file) as fh:
             self.feature_cols = [line.strip() for line in fh if line.strip()]
 
+        # Load model config (residual mode flag)
+        config_file = model_dir / "model_config_v3.json"
+        if config_file.exists():
+            with open(config_file) as fh:
+                config = json.load(fh)
+            self.residual_mode = config.get("residual_mode", False)
+        else:
+            self.residual_mode = False
+
         # Block tracking
         self.current_block_start_ms = 0
         self.open_ref = 0.0
@@ -56,7 +66,7 @@ class LivePredictor:
         for lo, hi, key in CALIB_BUCKETS:
             if lo <= seconds_to_expiry < hi:
                 return key
-        return "0-30"
+        return "0-30s (late)"
 
     def update_block(self, now_ms, ref):
         """
@@ -150,8 +160,15 @@ class LivePredictor:
         # Build feature vector
         X = np.array([[feats.get(col, 0.0) for col in self.feature_cols]])
 
-        # Predict
-        p_raw = float(self.model.predict(X)[0])
+        # Predict (residual mode: add brownian logit back)
+        if self.residual_mode:
+            brownian_p = feats.get("brownian_prob_drift", feats.get("brownian_prob", 0.5))
+            brownian_p = np.clip(brownian_p, 1e-4, 1 - 1e-4)
+            init_score = np.log(brownian_p / (1 - brownian_p))
+            raw_margin = float(self.model.predict(X, raw_score=True)[0])
+            p_raw = float(1.0 / (1.0 + np.exp(-(init_score + raw_margin))))
+        else:
+            p_raw = float(self.model.predict(X)[0])
 
         # Calibrate
         bucket_key = self._get_calib_bucket(seconds_to_expiry)

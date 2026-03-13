@@ -1,0 +1,86 @@
+PLAN: Optuna Hyperparameter Tuning
+===================================
+
+OBJETIVO
+--------
+Usar Optuna (Bayesian optimization) para encontrar los mejores hiperparámetros
+del modelo LightGBM y del walk-forward, maximizando accuracy/AUC en validación.
+
+BASELINE ACTUAL (154 features, 1s sampling, step=7, 8 folds)
+-------------------------------------------------------------
+- Accuracy: 0.7665
+- AUC: 0.8598
+- Brier: 0.1529
+- ECE: 0.0131
+
+QUÉ TUNEA OPTUNA
+-----------------
+
+1. Hiperparámetros del LightGBM:
+   - learning_rate: [0.005, 0.1]
+   - num_leaves: [15, 127]
+   - max_depth: [-1, 12]
+   - min_child_samples: [10, 100]
+   - subsample: [0.5, 1.0]
+   - colsample_bytree: [0.5, 1.0]
+   - reg_alpha: [0, 10]
+   - reg_lambda: [0, 10]
+   - n_estimators: [100, 2000]
+   - min_split_gain: [0, 1.0]
+
+2. Walk-forward step size:
+   - step_days: [1, 3, 5, 7]
+   - Más chico = más folds, evaluación más robusta, más tiempo
+
+3. Calibración (post-procesamiento):
+   - Número de buckets y tamaño (30s, 15s, 10s, 5s)
+   - Se ajusta DESPUÉS de encontrar los mejores hiperparámetros del modelo
+
+CÓMO FUNCIONA
+--------------
+1. Optuna propone un set de hiperparámetros
+2. Se corre walk-forward completo con esos hiperparámetros
+3. Se calcula la métrica objetivo (AUC promedio de los folds)
+4. Optuna aprende qué combinaciones funcionan mejor
+5. Repite N trials (50-200 trials)
+6. Al final, re-entrena con los mejores hiperparámetros encontrados
+
+MÉTRICA OBJETIVO
+-----------------
+- Primaria: AUC (más robusto que accuracy para optimización)
+- Secundarias a monitorear: accuracy, Brier, ECE, vs_BM en early block
+
+ORDEN DE EJECUCIÓN
+-------------------
+1. Crear script: src/training/tune_hyperparams.py
+2. Correr Optuna (~50 trials mínimo, idealmente 200)
+3. Analizar resultados y mejores hiperparámetros
+4. Re-entrenar modelo final con mejores params
+5. Luego ajustar calibración con buckets más finos (5s o 10s)
+6. Evaluar modelo final vs baseline
+
+CONSIDERACIONES
+----------------
+- Cada trial = walk-forward completo → cada trial tarda lo que tarda un entrenamiento
+- Con step=7 (8 folds) un trial tarda ~X minutos (medir primero)
+- 200 trials con step=7 = 200 * X minutos
+- Optuna usa pruning (MedianPruner) para cortar trials malos temprano
+- Se puede correr overnight si es necesario
+
+FEATURES MUERTAS (30 con importancia=0)
+----------------------------------------
+NO eliminar antes de Optuna. Con otros hiperparámetros alguna podría activarse.
+Si después de Optuna siguen en 0, eliminarlas del modelo final.
+
+Lista de features con importancia=0 actual:
+- core_streams_fresh_flag, open_ref_quality_flag, missing_stream_count
+- trade_size_cv_30s, large_trade_buy_pct_30s, volume_acceleration, large_trade_pct_30s
+- age_trades_ms, age_depth_ms, age_markprice_ms
+- vpin_30s, vpin_spike
+- ob_volume_to_cross_open_pct, ask_depth_change_pct_5s, bid_depth_change_pct_5s
+- cb_imbalance_L5, cb_leads_binance_5s, cb_divergence_velocity
+- return_10s, realized_vol_10s
+- fut_trade_intensity_5s, fut_signed_vol_z_10s, fut_signed_vol_z_30s
+- spot_signed_vol_z_30s, spot_trade_intensity_10s
+- basis_delta_5s, basis_delta_10s, basis_delta_30s
+- liq_any_30s, liq_burst_flag

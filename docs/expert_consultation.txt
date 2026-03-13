@@ -1,0 +1,464 @@
+================================================================================
+EXPERT CONSULTATION: BTC 5-MINUTE BINARY PREDICTION SYSTEM
+================================================================================
+
+There is significant capital behind this system. We need the best possible
+probability estimates and model configuration. Please analyze thoroughly
+and provide specific, actionable recommendations.
+
+================================================================================
+1. THE PROBLEM
+================================================================================
+
+We predict whether Bitcoin's price will be HIGHER or LOWER at the end of a
+5-minute block compared to the opening price of that block.
+
+Specifically:
+- Time is divided into deterministic 5-minute blocks (every 300 seconds,
+  aligned to UTC midnight: 00:00:00, 00:05:00, 00:10:00, ...)
+- At the START of each block, we record the "open_ref" price
+- At the END of each block (300s later), we record the "close_ref" price
+- Target: binary — 1 if close_ref >= open_ref (UP), 0 otherwise (DOWN)
+- We predict CONTINUOUSLY every 1 second within the block
+- At second 0 (block start), we have ~zero information about this block
+- At second 295 (5 seconds before close), the price has mostly decided
+- The model must output P(UP) — a well-calibrated probability, not just
+  a binary classification
+
+This is essentially a Polymarket-style binary options prediction problem.
+The prediction is used to decide whether to buy "UP" or "DOWN" contracts,
+where the payout depends on the accuracy of the probability estimate.
+
+KEY CHALLENGE: The model is very accurate late in the block (95%+ at 0-30s
+to expiry) because the price has already moved. The HARD problem is the
+first 30-60 seconds of the block (270-300s to expiry), where accuracy is
+~59% and directional edge over Brownian motion is ~50.7% (barely better
+than a coin flip).
+
+================================================================================
+2. DATA SOURCES
+================================================================================
+
+All data is tick-level from crypto exchanges, collected via websockets:
+
+FROM BINANCE (primary exchange):
+- Futures aggTrades: timestamp_ms, price, quantity, is_buyer_maker
+  (~50-200 trades/second for BTCUSDT perpetual)
+- Spot aggTrades: same fields for BTCUSDT spot market
+- Futures depth20: orderbook top 20 levels, ~100ms updates
+  (bid_prices[20], bid_qtys[20], ask_prices[20], ask_qtys[20])
+- Spot depth20: same for spot
+- Futures bookticker: best bid/ask, ~50ms updates
+- Spot bookticker: same for spot
+- Mark price + funding rate: every 3 seconds
+- Open interest, long/short ratios: every 5 minutes via REST API
+- Liquidation stream: forced liquidation events
+
+FROM COINBASE (secondary):
+- BTC-USD quotes (bid/ask)
+- BTC-USD trades
+- L2 orderbook (top 20 levels)
+
+FROM BYBIT (secondary):
+- BTCUSDT quotes (bid/ask)
+- BTCUSDT trades
+- Orderbook (top 20 levels)
+
+HISTORICAL DATA: 120 days (2025-11-11 to 2026-03-11)
+Total dataset: ~10.4 million rows (86,400 rows/day at 1s sampling)
+
+================================================================================
+3. FEATURES (154 total)
+================================================================================
+
+All features are computed at each timestamp T using ONLY data available at
+or before T. There is NO look-ahead bias. Features are grouped by category:
+
+GROUP A — Block State (15 features):
+  Static context about where price is relative to the block open.
+  - seconds_to_expiry: time remaining in block (300 → 0)
+  - dist_to_open_bps: current price vs open price in basis points
+  - max_runup/drawdown_since_open_bps: extreme moves since block start
+  - range_since_open_bps: total price range
+  - pct_time_above_open: fraction of block time spent above open
+  - num_crosses_open: how many times price crossed the open level
+  - current_position_in_range: where current price sits in [low, high]
+  - realized_vol_since_open, realized_vol_10s/30s/60s: volatility
+  - dist_to_open_z: dist_to_open normalized by realized vol (z-score)
+
+GROUP B — Microstructure (50 features):
+  Order flow, orderbook state, and trade dynamics.
+  - spot/fut_spread_bps: bid-ask spread
+  - spot/fut_imbalance_L1/L5: orderbook imbalance at level 1 and 5
+  - basis_bps + basis_delta_1s/5s/10s/30s: futures-spot spread and changes
+  - spot/fut_buy_pct_5s/10s/30s/60s: buyer aggression percentage
+  - spot/fut_signed_vol_z_10s/30s: signed volume z-score
+  - spot/fut_trade_intensity_5s/10s/30s: trades per second
+  - return_1s/5s/10s/30s/60s: price returns at multiple horizons
+  - block VWAP features: price vs volume-weighted average
+
+GROUP C — Regime (12 features):
+  Macro market conditions, updated every few seconds/minutes.
+  - funding_rate: perpetual futures funding rate
+  - minutes_to_funding: time until next funding payment
+  - mark_vs_index_bps: futures mark price vs index
+  - oi_change_pct_5m: open interest change
+  - long_short_ratio, top_trader ratios: positioning data
+  - liquidation features: recent forced liquidation activity
+
+GROUP D — Block History (10 features, STATIC per block):
+  What happened in previous blocks.
+  - prev_1/2/3_return_bps: returns of last 3 blocks
+  - prev_1_result: did last block go UP or DOWN
+  - up_pct_last_6: win rate of last 6 blocks
+  - mean/vol/max_abs_return_last_6: return statistics
+  - prev_15m/30m_realized_vol: recent volatility regime
+
+GROUP E — Temporal (7 features):
+  Time-of-day and day-of-week effects.
+  - hour_sin/cos, dow_sin/cos: cyclical time encoding
+  - is_us_market_hours: US equity market overlap
+  - minute_of_day, day_of_week: raw temporal
+
+GROUP F — Data Quality (7 features):
+  How fresh each data stream is (important for live inference).
+  - age_bookticker/markprice/depth/trades_ms
+  - missing_stream_count, open_ref_quality_flag
+
+GROUP G — Derived / Brownian (5 features):
+  Theoretical baseline and derived features.
+  - brownian_prob: theoretical P(UP) from Brownian motion model
+  - brownian_prob_drift: same with drift adjustment
+  - z_velocity: rate of change of the z-score
+  - bridge_variance: Brownian bridge remaining variance
+  - vol_ratio: realized vol vs expected vol
+
+GROUP H — Flow Dynamics (9 features):
+  Advanced trade flow analysis.
+  - large_trade_pct/buy_pct_30s: large trade activity
+  - buy_pressure_acceleration: change in buy pressure
+  - bid/ask_depth_change_pct_5s: orderbook depth changes
+  - spread_change_ratio_10s: spread dynamics
+
+GROUP I — Orderbook at Open (4 features):
+  Support/resistance at the critical open price level.
+  - ob_bid/ask_vol_near_open: volume concentration near open
+  - ob_imbalance_at_open: buy vs sell pressure at open level
+  - ob_volume_to_cross_open_pct: volume needed to cross open
+
+GROUP J — VPIN (4 features):
+  Volume-Synchronized Probability of Informed Trading.
+  - vpin_30s/120s: VPIN at two horizons (with proper trade splitting)
+  - vpin_signed_30s: directional VPIN
+  - vpin_spike: ratio of short to long VPIN
+
+GROUP K — Cross-Exchange (17 features):
+  Price/flow divergence across Binance, Coinbase, Bybit.
+  - cb/bb_spread_bps: spreads on other exchanges
+  - cb/bb_vs_binance_bps: price divergence
+  - cross_imbalance_consensus: averaged orderbook imbalance
+  - cb/bb_divergence_velocity: rate of change of divergence
+
+GROUP L — Pre-Block (9 features, STATIC per block):
+  Frozen snapshot of market state 0-30s before block opened.
+  - pb_momentum_10s/30s: price momentum entering block
+  - pb_acceleration: is momentum increasing
+  - pb_net_flow_10s/30s: order flow entering block
+  - pb_trade_intensity: activity level entering block
+  - pb_vol_30s/ratio: volatility entering block
+  - pb_liq_pressure_60s: liquidation pressure
+
+GROUP M — Previous Block Structure (2 features, STATIC per block):
+  - prev_trend_linearity: R² of price-vs-time in previous block
+  - prev_volume_profile: volume distribution in previous block
+
+GROUP N — Micro Dynamics (4 features):
+  - return_autocorr_30s: trending vs mean-reverting detection
+  - price_impact_30s: Kyle's lambda (market fragility)
+  - ob_seconds_to_cross_open: difficulty to cross open price
+  - ob_depth_concentration: orderbook shape (top-heavy vs distributed)
+
+GROUP O — Intra-Block Flow (3 features):
+  Pure flow since block start (does NOT cross block boundary).
+  - ib_buy_pct: buyer percentage since this block started
+  - ib_signed_vol_z: signed volume z-score since block start
+  - ib_volume_rate_ratio: current volume rate vs pre-block rate
+
+GROUP P — Orderbook Delta (3 features):
+  How the orderbook changed since block start.
+  - ob_imbalance_delta: imbalance now vs at block start
+  - ob_bid_depth_delta: bid volume now / bid volume at start
+  - ob_spread_delta_bps: spread now vs at block start
+
+GROUP Q — Micro-Tick (8 features):
+  1-second resolution signals.
+  - return_1s: last 1-second price return
+  - return_consistency_5s: fraction of last 5 1s-returns in same direction
+  - micro_acceleration: return_1s vs average over 5s
+  - realized_vol_3s: ultra-short volatility
+  - basis_delta_1s: basis change in 1 second
+  - trade_burst_1s: trade frequency spike detection
+  - ob_imbalance_change_1s/5s: orderbook imbalance momentum
+
+================================================================================
+4. MODEL ARCHITECTURE
+================================================================================
+
+MODEL: LightGBM (gradient boosted decision trees)
+TASK: Binary classification (P(UP) for each 1-second sample)
+
+CURRENT HYPERPARAMETERS:
+  objective:        binary
+  metric:           binary_logloss
+  boosting_type:    gbdt
+  num_leaves:       63
+  learning_rate:    0.01
+  subsample:        0.8
+  subsample_freq:   1
+  colsample_bytree: 0.7
+  min_child_samples: 300
+  reg_alpha:        0.1
+  reg_lambda:       1.0
+  max_bin:          255
+  n_estimators:     3000 (with early stopping at 50 rounds)
+  seed:             42
+  verbosity:        -1
+
+WHY LIGHTGBM:
+- Handles NaN natively (cross-exchange features are NaN when data missing)
+- Fast training on 10M+ rows
+- Good out-of-box probability estimates with logloss objective
+- Handles mixed feature types well (ratios, counts, booleans, cyclical)
+
+================================================================================
+5. TRAINING METHODOLOGY
+================================================================================
+
+WALK-FORWARD VALIDATION (strict temporal, no data leakage):
+
+  |-------- Train (56 days) --------|-- Calib (15%) --|--- Test (14 days) ---|
+  |                                 |                 |                      |
+  |  LightGBM trains here           | Isotonic cal.   |  Evaluate here       |
+  |                                 | trained here    |                      |
+
+  Then slide forward by step_days (currently 7) and repeat.
+
+  Total: 8 folds covering the full 120-day dataset.
+
+WITHIN EACH FOLD:
+  1. Train LightGBM on 85% of train window
+  2. Fit isotonic calibrators on remaining 15% (temporal split)
+  3. Evaluate on test window with calibrated probabilities
+  4. Record all metrics per fold
+
+EARLY STOPPING:
+  - Monitor binary_logloss on a validation set
+  - Stop if no improvement for 50 rounds
+  - Prevents overfitting to training data
+
+================================================================================
+6. CALIBRATION APPROACH
+================================================================================
+
+CURRENT METHOD: Isotonic Regression per time bucket
+
+TIME BUCKETS (6):
+  - 240-300s (early block, hardest)
+  - 180-240s
+  - 120-180s
+  - 60-120s
+  - 30-60s
+  - 0-30s (late block, easiest)
+
+WHY PER BUCKET: The model's behavior changes dramatically with
+seconds_to_expiry. At 295s, predictions cluster near 0.5. At 5s,
+predictions are near 0 or 1. A single calibrator would be inappropriate.
+
+PROCESS:
+  1. LightGBM outputs raw P(UP) on calibration set
+  2. For each time bucket, fit IsotonicRegression(y_min=0.01, y_max=0.99)
+  3. During evaluation/inference, apply the appropriate calibrator based
+     on seconds_to_expiry
+
+CONCERN: With 1-second sampling, 30-second buckets may be too coarse.
+A prediction at 270s (model accuracy ~59%) and 299s (~56%) are in the
+same calibration bucket but have very different base rates.
+
+QUESTIONS FOR EXPERTS:
+  - Should we use finer buckets (10s? 5s? per-second?) now that we have
+    10.4M rows of training data?
+  - Should calibration be conditional on MORE than just time? E.g.,
+    calibrate by time + volatility regime + distance-to-open?
+  - Is isotonic regression the right method? Should we consider:
+    - Platt scaling (logistic regression on raw predictions)
+    - Beta calibration
+    - Venn-Abers predictors (guaranteed coverage)
+    - Temperature scaling
+    - A neural network calibrator?
+  - Should we use focal loss instead of logloss to improve calibration
+    during training itself?
+
+================================================================================
+7. CURRENT RESULTS (146 features, 5s sampling)
+================================================================================
+
+WALK-FORWARD SUMMARY (8 folds):
+  accuracy            : mean=0.7634, std=0.0072
+  logloss             : mean=0.4627, std=0.0099
+  brier               : mean=0.1544, std=0.0038
+  auc                 : mean=0.8570, std=0.0071
+  ece                 : mean=0.0143, std=0.0034
+  delta_vs_brownian   : mean=+0.0035
+
+  Consistency: LightGBM > Brownian baseline in 8/8 folds
+
+ACCURACY BY PHASE (seconds to expiry):
+  270-300s (hardest):  Acc=0.5926, AUC=0.6318, vs_BM=+0.0013
+  240-270s:            Acc=0.6386, AUC=0.6928, vs_BM=+0.0011
+  210-240s:            Acc=0.6781, AUC=0.7448, vs_BM=+0.0038
+  180-210s:            Acc=0.7183, AUC=0.7892, vs_BM=+0.0037
+  150-180s:            Acc=0.7521, AUC=0.8290, vs_BM=+0.0031
+  120-150s:            Acc=0.7852, AUC=0.8656, vs_BM=+0.0026
+  90-120s:             Acc=0.8234, AUC=0.9027, vs_BM=+0.0026
+  60-90s:              Acc=0.8619, AUC=0.9335, vs_BM=+0.0041
+  30-60s:              Acc=0.9025, AUC=0.9632, vs_BM=+0.0037
+  0-30s (easiest):     Acc=0.9504, AUC=0.9879, vs_BM=+0.0030
+
+DIRECTIONAL EDGE (when model disagrees with Brownian):
+  240-300s: Model right 50.7% (barely above coin flip, 3/8 folds significant)
+  180-240s: Model right 52.2% (5/8 significant)
+  120-180s: Model right 52.5% (7/8 significant)
+  60-120s:  Model right 55.7% (8/8 significant)
+  30-60s:   Model right 58.8% (8/8 significant)
+  0-30s:    Model right 63.2% (8/8 significant)
+
+CALIBRATION QUALITY (Brier score, model vs Brownian baseline):
+  All 6 time buckets: MODEL is better than Brownian
+  Calibration errors mostly < 1% (good)
+  Some WARN buckets with <200 samples and >4% error
+
+TOP 10 FEATURES (by split count in final model):
+   1. seconds_to_expiry          5.5%
+   2. dist_to_open_z             4.3%
+   3. brownian_prob              4.2%
+   4. vol_ratio                  4.2%
+   5. mean_return_last_6         3.3%
+   6. ob_spread_delta_bps        3.2%  ← NEW (orderbook delta)
+   7. dist_to_open_bps           3.2%
+   8. bb_ob_near_open            2.5%
+   9. vol_last_6                 2.5%
+  10. pb_momentum_10s            2.4%  ← pre-block momentum
+
+================================================================================
+8. BROWNIAN MOTION BASELINE
+================================================================================
+
+Our theoretical baseline uses a Brownian bridge model:
+
+  Given: current price P, open price O, volatility σ, time remaining t
+
+  z = (P - O) / (σ * √t)        # standardized distance
+  P(UP) = Φ(z)                    # normal CDF
+
+This is the mathematically optimal predictor IF price were a pure random
+walk with known volatility. Our model's goal is to BEAT this baseline by
+exploiting market microstructure, order flow, and regime information.
+
+The delta_vs_bm metric measures how much better we are than Brownian.
+Currently: +0.35% accuracy overall, with the edge concentrated in mid-to-late
+block (60-180s to expiry).
+
+================================================================================
+9. NEXT STEPS PLANNED
+================================================================================
+
+A) HYPERPARAMETER TUNING WITH OPTUNA:
+   - Bayesian optimization over LightGBM hyperparameters
+   - Search space:
+     num_leaves:        [15, 127]
+     max_depth:         [4, 12]
+     learning_rate:     [0.005, 0.1] (log scale)
+     min_child_samples: [50, 1000]
+     subsample:         [0.5, 1.0]
+     colsample_bytree:  [0.4, 1.0]
+     reg_alpha:         [0.001, 10] (log scale)
+     reg_lambda:        [0.001, 10] (log scale)
+     min_split_gain:    [0.0, 1.0]
+   - Objective: minimize mean logloss across 8 walk-forward folds
+   - Budget: 100-200 trials
+   - Pruning: MedianPruner to cut bad trials early
+
+B) 1-SECOND SAMPLING (being built now):
+   - 5x more training data (10.4M rows vs 2M)
+   - 8 new micro-tick features (return_1s, trade_burst_1s, etc.)
+   - Expectation: marginal improvement in early block accuracy
+
+C) CALIBRATION REFINEMENT:
+   - Finer time buckets
+   - Conditional calibration (time + other features)
+   - This is where we most need expert guidance
+
+================================================================================
+10. SPECIFIC QUESTIONS FOR EXPERTS
+================================================================================
+
+PRIORITY 1 — CALIBRATION:
+  1. What is the state-of-the-art for probability calibration in financial
+     binary prediction? Is isotonic regression per time bucket optimal?
+  2. Should we calibrate conditioning on multiple variables (time +
+     volatility + distance_to_open)? How to avoid overfitting the
+     calibration layer?
+  3. With 10.4M samples, can we afford per-second calibration or would
+     that overfit?
+  4. Should we consider Venn-Abers predictors for guaranteed calibration?
+  5. Is the 85%/15% train/calibration split optimal? Should calibration
+     get more data?
+
+PRIORITY 2 — MODEL ARCHITECTURE:
+  6. Is LightGBM the right model for this task, or should we consider
+     neural networks (TabNet, FT-Transformer, temporal CNNs)?
+  7. Should we train SEPARATE models for different time phases (e.g.,
+     one model for 240-300s, another for 0-60s)?
+  8. Would a two-stage model help? (Stage 1: predict volatility regime,
+     Stage 2: predict direction conditional on regime)
+  9. Should we use sample weighting to emphasize early-block predictions
+     where accuracy matters most for profitability?
+
+PRIORITY 3 — FEATURE ENGINEERING:
+  10. Are 154 features too many? Should we do feature selection before
+      tuning? (RFECV, permutation importance, SHAP)
+  11. Many features are correlated (e.g., return_1s/5s/10s/30s/60s).
+      Should we reduce redundancy?
+  12. The top features are dominated by "trivial" ones (seconds_to_expiry,
+      dist_to_open_bps). Is this a sign that the model relies too heavily
+      on the Brownian baseline and adds little marginal value?
+
+PRIORITY 4 — TRAINING METHODOLOGY:
+  13. Is walk-forward with 56-day train / 14-day test optimal?
+      Should we use expanding window instead of sliding?
+  14. How should we set early_stopping_rounds with 10.4M samples?
+  15. Should we use different loss functions (focal loss, weighted
+      logloss) to improve early-block performance?
+
+PRIORITY 5 — OPERATIONAL:
+  16. After Optuna tuning, how do we validate that the selected
+      hyperparameters aren't overfit to the validation structure?
+  17. How often should the model be retrained with new data?
+  18. Should we maintain an ensemble of models trained on different
+      time windows?
+
+================================================================================
+11. CONSTRAINTS
+================================================================================
+
+- Predictions must run in <100ms (1-second inference loop)
+- Model must handle NaN features gracefully (websocket disconnections)
+- All features must be computable from real-time data (no look-ahead)
+- The system runs on a single EC2 instance (no GPU cluster available)
+- Training data: 120 days, growing daily with new downloads
+- The prediction is used for actual trading — accuracy of probabilities
+  directly impacts P&L
+
+================================================================================
+END OF DOCUMENT
+================================================================================

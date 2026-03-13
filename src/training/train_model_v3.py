@@ -67,6 +67,21 @@ PARAMS = {
 NUM_BOOST_ROUND = 3000
 EARLY_STOPPING  = 500
 
+# Features to exclude when using residual mode (brownian as init_score)
+BROWNIAN_FEATURES = ["brownian_prob", "brownian_prob_drift"]
+
+
+def compute_init_score(df):
+    """Compute init_score = logit(brownian_prob_drift) for residual training."""
+    p = df["brownian_prob_drift"].values.astype(float)
+    p = np.clip(p, 1e-4, 1 - 1e-4)
+    return np.log(p / (1 - p))  # logit
+
+
+def get_residual_feature_cols():
+    """Feature columns excluding brownian features (used as init_score instead)."""
+    return [c for c in FEATURE_COLUMNS_V3 if c not in BROWNIAN_FEATURES]
+
 # Time buckets for calibration and phase analysis
 TIME_BUCKETS = [
     (240, 300, "240-300s (early)"),
@@ -242,12 +257,16 @@ def evaluate_baseline(name, y_true, y_pred_proba, y_pred_class):
 # Training
 # ---------------------------------------------------------------------------
 
-def train_lgb(X_train, y_train, X_val, y_val):
+def train_lgb(X_train, y_train, X_val, y_val, feature_names=None,
+              init_score_train=None, init_score_val=None):
     """Train LightGBM binary. Returns (model, best_iteration)."""
+    feat_names = feature_names or FEATURE_COLUMNS_V3
     dtrain = lgb.Dataset(X_train, label=y_train,
-                         feature_name=FEATURE_COLUMNS_V3, free_raw_data=False)
+                         feature_name=feat_names, free_raw_data=False,
+                         init_score=init_score_train)
     dval = lgb.Dataset(X_val, label=y_val,
-                       reference=dtrain, free_raw_data=False)
+                       reference=dtrain, free_raw_data=False,
+                       init_score=init_score_val)
 
     model = lgb.train(
         PARAMS,
@@ -298,12 +317,26 @@ def apply_calibrators(y_pred_proba, seconds_to_expiry, calibrators):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
+def predict_with_init_score(model, X, init_score=None):
+    """Predict probabilities, adding init_score offset if residual mode.
+
+    When trained with init_score, model.predict() returns only the tree contribution.
+    We must add init_score back and apply sigmoid to get final probabilities.
+    """
+    if init_score is not None:
+        raw_margin = model.predict(X, raw_score=True)
+        logits = init_score + raw_margin
+        return 1.0 / (1.0 + np.exp(-logits))
+    return model.predict(X)
+
+
+def evaluate_fold(model, X, y, df_meta, calibrators, fold_label="",
+                  init_score=None):
     """
     Full evaluation of a fold. Prints comprehensive report.
     Returns dict of metrics.
     """
-    y_proba = model.predict(X)
+    y_proba = predict_with_init_score(model, X, init_score)
     y_pred = (y_proba >= 0.5).astype(int)
 
     seconds = df_meta["seconds_to_expiry"].values
@@ -455,6 +488,7 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
 
     # --- 5. Feature importance ---
     importance = model.feature_importance(importance_type="split")
+    feat_names = model.feature_name()
     sorted_idx = np.argsort(importance)[::-1]
     total_imp = importance.sum()
 
@@ -462,20 +496,20 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
     print(f"     Top 30:")
     for rank, idx in enumerate(sorted_idx[:30], 1):
         pct = importance[idx] / total_imp * 100 if total_imp > 0 else 0
-        print(f"       {rank:3d}. {FEATURE_COLUMNS_V3[idx]:45s} {importance[idx]:>8,} ({pct:.1f}%)")
+        print(f"       {rank:3d}. {feat_names[idx]:45s} {importance[idx]:>8,} ({pct:.1f}%)")
 
     print(f"\n     Bottom 30:")
-    for rank, idx in enumerate(sorted_idx[-30:], len(FEATURE_COLUMNS_V3) - 29):
-        print(f"       {rank:3d}. {FEATURE_COLUMNS_V3[idx]:45s} {importance[idx]:>8,}")
+    for rank, idx in enumerate(sorted_idx[-30:], len(feat_names) - 29):
+        print(f"       {rank:3d}. {feat_names[idx]:45s} {importance[idx]:>8,}")
 
     zero_imp = (importance == 0).sum()
-    print(f"\n     Features with importance = 0: {zero_imp}/{len(FEATURE_COLUMNS_V3)}")
+    print(f"\n     Features with importance = 0: {zero_imp}/{len(feat_names)}")
 
     # Importance by group
     print(f"\n     Importance by group:")
     for group_name, group_cols in FEATURE_GROUPS.items():
-        group_imp = sum(importance[FEATURE_COLUMNS_V3.index(c)]
-                        for c in group_cols if c in FEATURE_COLUMNS_V3)
+        group_imp = sum(importance[feat_names.index(c)]
+                        for c in group_cols if c in feat_names)
         pct = group_imp / total_imp * 100 if total_imp > 0 else 0
         print(f"       {group_name:<20s}: {pct:5.1f}%")
 
@@ -558,19 +592,22 @@ def evaluate_fold(model, X, y, df_meta, calibrators, fold_label=""):
 # Walk-forward validation
 # ---------------------------------------------------------------------------
 
-def walk_forward(df, train_days=56, test_days=14, step_days=7):
+def walk_forward(df, train_days=56, test_days=14, step_days=7, residual=False):
     """
     Walk-forward with block grouping and embargo.
     Train split: 85% train, 15% calibration (last 15% of train period).
+    If residual=True, use brownian_prob_drift as init_score and exclude brownian features.
     """
     dates = get_day_boundaries(df)
     n_dates = len(dates)
     embargo_blocks = 2  # 10 minutes = 2 blocks
 
-    n_features = len(FEATURE_COLUMNS_V3)
+    feature_cols = get_residual_feature_cols() if residual else FEATURE_COLUMNS_V3
+    n_features = len(feature_cols)
     n_rows = len(df)
     n_folds = (n_dates - train_days - test_days) // step_days + 1
-    print(f"\nWalk-forward: {n_dates} days, {n_rows:,} rows, {n_features} features")
+    mode_str = "RESIDUAL (brownian as init_score)" if residual else "STANDARD"
+    print(f"\nWalk-forward [{mode_str}]: {n_dates} days, {n_rows:,} rows, {n_features} features")
     print(f"  train={train_days}d, test={test_days}d, step={step_days}d, "
           f"embargo={embargo_blocks} blocks, ~{n_folds} folds")
 
@@ -626,19 +663,28 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
               f"({len(train_dates)} days, {len(df_train):,} train, {len(df_calib):,} calib), "
               f"test {min(test_dates)}..{max(test_dates)} ({len(test_dates)} days, {len(df_test):,} rows) ---")
 
-        X_train = df_train[FEATURE_COLUMNS_V3].values
+        X_train = df_train[feature_cols].values
         y_train = df_train["target"].values.astype(int)
-        X_calib = df_calib[FEATURE_COLUMNS_V3].values
+        X_calib = df_calib[feature_cols].values
         y_calib = df_calib["target"].values.astype(int)
-        X_test = df_test[FEATURE_COLUMNS_V3].values
+        X_test = df_test[feature_cols].values
         y_test = df_test["target"].values.astype(int)
 
+        # Compute init_score if residual mode
+        is_train = compute_init_score(df_train) if residual else None
+        is_test = compute_init_score(df_test) if residual else None
+        is_calib = compute_init_score(df_calib) if residual else None
+
         # Train (use test for early stopping signal only)
-        model, best_iter = train_lgb(X_train, y_train, X_test, y_test)
+        model, best_iter = train_lgb(
+            X_train, y_train, X_test, y_test,
+            feature_names=feature_cols,
+            init_score_train=is_train, init_score_val=is_test,
+        )
         print(f"  Best iteration: {best_iter}")
 
         # Fit calibrators on calib set
-        calib_proba = model.predict(X_calib)
+        calib_proba = predict_with_init_score(model, X_calib, is_calib)
         calib_seconds = df_calib["seconds_to_expiry"].values
         calibrators = fit_calibrators(y_calib, calib_proba, calib_seconds)
 
@@ -650,7 +696,8 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
         # Evaluate
         result = evaluate_fold(
             model, X_test, y_test, df_test_meta, calibrators,
-            fold_label=f"Fold {fold} test ({min(test_dates)} to {max(test_dates)})"
+            fold_label=f"Fold {fold} test ({min(test_dates)} to {max(test_dates)})",
+            init_score=is_test,
         )
         result["fold"] = fold
         result["train_start"] = str(min(train_dates))
@@ -663,7 +710,7 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
         result["n_test"] = len(df_test)
 
         # --- Disagreement analysis: model vs Brownian ---
-        test_proba = model.predict(X_test)
+        test_proba = predict_with_init_score(model, X_test, is_test)
         test_seconds = df_test["seconds_to_expiry"].values
         test_dist = df_test["dist_to_open_bps"].values
         test_vol = df_test["realized_vol_60s"].values
@@ -1016,6 +1063,8 @@ def save_model(model, calibrators, results, output_dir=None):
     d = Path(output_dir) if output_dir else OUTPUT_DIR
     d.mkdir(parents=True, exist_ok=True)
 
+    residual = results.get("residual_mode", False)
+
     # Model
     model_path = d / "lightgbm_v3.txt"
     model.save_model(str(model_path))
@@ -1027,10 +1076,17 @@ def save_model(model, calibrators, results, output_dir=None):
         pickle.dump(calibrators, f)
     print(f"Calibrators saved: {cal_path}")
 
-    # Feature columns
+    # Feature columns (from model, which may exclude brownian features in residual mode)
+    feat_names = model.feature_name()
     cols_path = d / "feature_columns_v3.txt"
-    cols_path.write_text("\n".join(FEATURE_COLUMNS_V3))
-    print(f"Feature columns saved: {cols_path}")
+    cols_path.write_text("\n".join(feat_names))
+    print(f"Feature columns saved: {cols_path} ({len(feat_names)} features)")
+
+    # Save residual mode config
+    config = {"residual_mode": residual}
+    config_path = d / "model_config_v3.json"
+    config_path.write_text(json.dumps(config, indent=2))
+    print(f"Model config saved: {config_path}")
 
     # Metrics
     metrics_path = d / "metrics_v3.json"
@@ -1064,6 +1120,8 @@ def main():
     parser.add_argument("--train-days", type=int, default=56, help="Walk-forward train window (days)")
     parser.add_argument("--test-days", type=int, default=14, help="Walk-forward test window (days)")
     parser.add_argument("--step-days", type=int, default=7, help="Walk-forward step (days)")
+    parser.add_argument("--residual", action="store_true",
+                        help="Use brownian_prob_drift as init_score (residual learning)")
     args = parser.parse_args()
 
     print("Loading dataset...")
@@ -1078,8 +1136,12 @@ def main():
     print(f"  Down: {n_down:>10,} ({n_down / total * 100:.1f}%)")
     print(f"  Blocks: {df['block_start_ms'].nunique():,}")
 
+    residual = getattr(args, 'residual', False)
+    feature_cols = get_residual_feature_cols() if residual else FEATURE_COLUMNS_V3
+
     if args.walkforward:
-        wf_results = walk_forward(df, args.train_days, args.test_days, args.step_days)
+        wf_results = walk_forward(df, args.train_days, args.test_days, args.step_days,
+                                  residual=residual)
 
         # Train final model on all data
         print(f"\n{'='*70}")
@@ -1095,31 +1157,41 @@ def main():
         df_final_train = df[df["block_start_ms"].isin(train_blocks)]
         df_final_calib = df[df["block_start_ms"].isin(calib_blocks)]
 
-        X_train = df_final_train[FEATURE_COLUMNS_V3].values
+        X_train = df_final_train[feature_cols].values
         y_train = df_final_train["target"].values.astype(int)
-        X_calib = df_final_calib[FEATURE_COLUMNS_V3].values
+        X_calib = df_final_calib[feature_cols].values
         y_calib = df_final_calib["target"].values.astype(int)
 
-        final_model, best_iter = train_lgb(X_train, y_train, X_calib, y_calib)
+        # Init scores for final model
+        is_train_final = compute_init_score(df_final_train) if residual else None
+        is_calib_final = compute_init_score(df_final_calib) if residual else None
+
+        final_model, best_iter = train_lgb(
+            X_train, y_train, X_calib, y_calib,
+            feature_names=feature_cols,
+            init_score_train=is_train_final, init_score_val=is_calib_final,
+        )
         print(f"  Final model best iteration: {best_iter}")
 
         # Fit final calibrators
-        calib_proba = final_model.predict(X_calib)
+        calib_proba = predict_with_init_score(final_model, X_calib, is_calib_final)
         calib_seconds = df_final_calib["seconds_to_expiry"].values
         final_calibrators = fit_calibrators(y_calib, calib_proba, calib_seconds)
 
         # Feature importance
         importance = final_model.feature_importance(importance_type="split")
+        feat_names_final = final_model.feature_name()
         sorted_idx = np.argsort(importance)[::-1]
         total_imp = importance.sum()
 
         print(f"\n  Top 30 features (final model):")
         for rank, idx in enumerate(sorted_idx[:30], 1):
             pct = importance[idx] / total_imp * 100 if total_imp > 0 else 0
-            print(f"    {rank:3d}. {FEATURE_COLUMNS_V3[idx]:45s} {importance[idx]:>8,} ({pct:.1f}%)")
+            print(f"    {rank:3d}. {feat_names_final[idx]:45s} {importance[idx]:>8,} ({pct:.1f}%)")
 
         save_model(final_model, final_calibrators,
-                   {"walk_forward": wf_results, "best_iteration": best_iter},
+                   {"walk_forward": wf_results, "best_iteration": best_iter,
+                    "residual_mode": residual},
                    args.output_dir)
 
     else:
@@ -1144,28 +1216,38 @@ def main():
         print(f"\nTemporal split: train={len(df_real_train):,}, calib={len(df_calib):,}, "
               f"test={len(df_test):,}")
 
-        X_train = df_real_train[FEATURE_COLUMNS_V3].values
+        X_train = df_real_train[feature_cols].values
         y_train = df_real_train["target"].values.astype(int)
-        X_calib = df_calib[FEATURE_COLUMNS_V3].values
+        X_calib = df_calib[feature_cols].values
         y_calib = df_calib["target"].values.astype(int)
-        X_test = df_test[FEATURE_COLUMNS_V3].values
+        X_test = df_test[feature_cols].values
         y_test = df_test["target"].values.astype(int)
 
-        model, best_iter = train_lgb(X_train, y_train, X_test, y_test)
+        is_train_s = compute_init_score(df_real_train) if residual else None
+        is_test_s = compute_init_score(df_test) if residual else None
+        is_calib_s = compute_init_score(df_calib) if residual else None
+
+        model, best_iter = train_lgb(
+            X_train, y_train, X_test, y_test,
+            feature_names=feature_cols,
+            init_score_train=is_train_s, init_score_val=is_test_s,
+        )
         print(f"  Best iteration: {best_iter}")
 
         # Calibrate
-        calib_proba = model.predict(X_calib)
+        calib_proba = predict_with_init_score(model, X_calib, is_calib_s)
         calib_seconds = df_calib["seconds_to_expiry"].values
         calibrators = fit_calibrators(y_calib, calib_proba, calib_seconds)
 
         meta_cols = ["block_start_ms", "seconds_to_expiry", "dist_to_open_bps",
                      "realized_vol_60s", "terminal_return_bps"]
         result = evaluate_fold(model, X_test, y_test, df_test[meta_cols],
-                               calibrators, fold_label="Test set (temporal split)")
+                               calibrators, fold_label="Test set (temporal split)",
+                               init_score=is_test_s)
 
         save_model(model, calibrators,
-                   {"mode": "temporal_split", "best_iteration": best_iter, **result},
+                   {"mode": "temporal_split", "best_iteration": best_iter,
+                    "residual_mode": residual, **result},
                    args.output_dir)
 
     print("\nDone.")
