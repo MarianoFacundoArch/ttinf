@@ -25,7 +25,11 @@ pip install \
     websockets>=12.0 \
     aiohttp>=3.9
 
-echo "=== 3. Verify installs ==="
+echo "=== 3. Compile C book builder ==="
+gcc -O2 -o tools/book_builder tools/book_builder.c
+echo "  book_builder compiled OK"
+
+echo "=== 4. Verify installs ==="
 python -c "
 import pandas, pyarrow, numpy, lightgbm, sklearn, requests
 print(f'  pandas:   {pandas.__version__}')
@@ -36,7 +40,7 @@ print(f'  sklearn:  {sklearn.__version__}')
 print('  All OK!')
 "
 
-echo "=== 4. Set up TARDIS API key ==="
+echo "=== 5. Set up TARDIS API key ==="
 # Add to bashrc so it persists
 if ! grep -q TARDIS_API_KEY ~/.bashrc; then
     echo '' >> ~/.bashrc
@@ -46,7 +50,7 @@ if ! grep -q TARDIS_API_KEY ~/.bashrc; then
     echo 'source ~/venv/bin/activate' >> ~/.bashrc
 fi
 
-echo "=== 5. Check disk space ==="
+echo "=== 6. Check disk space ==="
 df -h /
 
 echo ""
