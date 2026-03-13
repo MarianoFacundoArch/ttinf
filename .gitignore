@@ -2,10 +2,8 @@
 /data/
 /datasets/
 
-# Models
-models/*.bin
-models/*.pkl
-models/*.joblib
+# Models (trained on EC2, don't track)
+models/
 
 # Python
 __pycache__/
