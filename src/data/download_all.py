@@ -16,10 +16,11 @@ import argparse
 import gzip
 import io
 import os
+import subprocess
 import sys
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -488,12 +489,122 @@ def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(result)
 
 
+# ---------------------------------------------------------------------------
+# C-accelerated book reconstruction
+# ---------------------------------------------------------------------------
+
+BOOK_BUILDER_BIN = Path(__file__).resolve().parent.parent.parent / "tools" / "book_builder"
+
+
+def _find_book_builder() -> str | None:
+    """Find the compiled book_builder binary."""
+    if BOOK_BUILDER_BIN.exists():
+        return str(BOOK_BUILDER_BIN)
+    return None
+
+
+def _process_book_l2_c(csv_bytes: bytes) -> pd.DataFrame:
+    """
+    Process incremental_book_L2 using compiled C book_builder.
+    Uses temp file + mmap for maximum speed (~5-10x faster than Python).
+
+    Input: raw CSV bytes (decompressed)
+    Output: DataFrame matching book_snapshot_25 format
+    """
+    import numpy as np
+    import tempfile
+
+    bin_path = _find_book_builder()
+    if bin_path is None:
+        raise FileNotFoundError("book_builder binary not found")
+
+    # Write CSV to temp file so C can mmap it (much faster than stdin pipe)
+    with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as f:
+        f.write(csv_bytes)
+        tmp_csv = f.name
+
+    try:
+        proc = subprocess.run(
+            [bin_path, tmp_csv],
+            capture_output=True,
+            timeout=300,
+        )
+    finally:
+        os.unlink(tmp_csv)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"book_builder failed: {proc.stderr.decode()[:500]}")
+
+    raw = proc.stdout
+    SNAP_BYTES = 648  # 8 + 80*8
+    n_snaps = len(raw) // SNAP_BYTES
+
+    if n_snaps == 0:
+        cols = ["timestamp_ms", "recv_ts"]
+        for j in range(20):
+            cols.extend([f"bid_price_{j}", f"bid_qty_{j}",
+                         f"ask_price_{j}", f"ask_qty_{j}"])
+        return pd.DataFrame(columns=cols)
+
+    # Parse binary: structured numpy dtype
+    dt = np.dtype([
+        ('ts', np.int64),
+        ('bp', np.float64, 20),
+        ('bq', np.float64, 20),
+        ('ap', np.float64, 20),
+        ('aq', np.float64, 20),
+    ])
+    snaps = np.frombuffer(raw[:n_snaps * SNAP_BYTES], dtype=dt)
+
+    # Build DataFrame
+    result = {
+        "timestamp_ms": snaps['ts'],
+        "recv_ts": snaps['ts'],
+    }
+    for j in range(20):
+        result[f"bid_price_{j}"] = snaps['bp'][:, j]
+        result[f"bid_qty_{j}"] = snaps['bq'][:, j]
+        result[f"ask_price_{j}"] = snaps['ap'][:, j]
+        result[f"ask_qty_{j}"] = snaps['aq'][:, j]
+
+    return pd.DataFrame(result)
+
+
 def _save_parquet(df: pd.DataFrame, date_str: str, stream: str) -> int:
     out_path = OUTPUT_DIR / date_str / stream / "full_day.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(df, preserve_index=False)
     pq.write_table(table, out_path, compression="snappy")
     return out_path.stat().st_size
+
+
+def _tardis_download_raw(exchange: str, data_type: str, date_str: str,
+                         symbol: str = None) -> bytes | None:
+    """Download raw gzip bytes from Tardis (no parsing). Returns decompressed CSV bytes."""
+    year, month, day = date_str.split("-")
+    sym = symbol or SYMBOL
+    url = f"{TARDIS_BASE}/{exchange}/{data_type}/{year}/{month}/{day}/{sym}.csv.gz"
+    headers = {"Authorization": f"Bearer {TARDIS_API_KEY}"} if TARDIS_API_KEY else {}
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=120)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                wait = 10 * (attempt + 1)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+
+    return gzip.decompress(resp.content)
 
 
 def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
@@ -505,6 +616,33 @@ def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
         return "skip", 0, 0
 
     symbol = ds.get("symbol")  # None for Binance (uses global SYMBOL)
+    post = ds.get("post_process")
+
+    # Fast path: use C binary for incremental_book_l2
+    if post == "incremental_book_l2" and _find_book_builder():
+        sys.stdout.write(f"\r\033[K  ⏳ {ds_name} {date_str}: downloading...\n")
+        sys.stdout.flush()
+        csv_bytes = _tardis_download_raw(ds["exchange"], ds["data_type"],
+                                          date_str, symbol=symbol)
+        if csv_bytes is None:
+            return "404", 0, 0
+        dl_bytes = len(csv_bytes)
+        if dl_bytes < 100:
+            return "empty", 0, 0
+
+        sys.stdout.write(f"\r\033[K  ⚡ {ds_name} {date_str}: processing with C book_builder...\n")
+        sys.stdout.flush()
+        df = _process_book_l2_c(csv_bytes)
+        del csv_bytes
+        gc.collect()
+
+        file_size = _save_parquet(df, date_str, ds["output_stream"])
+        n_rows = len(df)
+        del df
+        gc.collect()
+        return "done", n_rows, dl_bytes
+
+    # Standard path: download as DataFrame
     sys.stdout.write(f"\r\033[K  ⏳ {ds_name} {date_str}: downloading...\n")
     sys.stdout.flush()
     result = _tardis_download_csv(ds["exchange"], ds["data_type"], date_str,
@@ -516,9 +654,7 @@ def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
     if len(df) == 0:
         return "empty", 0, 0
 
-    post = ds.get("post_process")
-
-    # Incremental L2 needs raw data before column mapping
+    # Incremental L2 fallback (no C binary)
     if post == "incremental_book_l2":
         df = _process_incremental_book_l2(df)
         file_size = _save_parquet(df, date_str, ds["output_stream"])
@@ -838,7 +974,8 @@ Examples:
         # Only download cb_book_l2
         all_jobs = create_jobs(start_date, end_date, cross_only=True)
         all_jobs = [(s, d, dt) for s, d, dt in all_jobs if d == "cb_book_l2"]
-        mode = "CB_BOOK_L2 ONLY"
+        c_bin = _find_book_builder()
+        mode = "CB_BOOK_L2 ONLY" + (" (C accelerated ⚡)" if c_bin else " (Python - slow)")
         n_ds = 1
     else:
         all_jobs = create_jobs(start_date, end_date, cross_only=cross_only)
@@ -863,7 +1000,10 @@ Examples:
 
     tracker = ProgressTracker(len(all_jobs))
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    # Use ProcessPoolExecutor for --book-only (CPU-bound C processing)
+    # ThreadPoolExecutor for everything else (I/O-bound downloads)
+    PoolClass = ProcessPoolExecutor if book_only else ThreadPoolExecutor
+    with PoolClass(max_workers=args.workers) as pool:
         futures = {pool.submit(execute_job, job): job for job in all_jobs}
 
         for future in as_completed(futures):
