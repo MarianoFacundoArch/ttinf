@@ -1225,8 +1225,8 @@ def compute_preblock(day, block_start_ms):
 
     # --- Momentum: price return before block open ---
     # Use futures trades for best liquidity
-    ts = day.ft_ts
-    prices = day.ft_price
+    ts = day.tf_ts
+    prices = day.tf_price
 
     # Price at block open (last trade before t0)
     idx_0 = _last_before(ts, t0)
@@ -1255,8 +1255,8 @@ def compute_preblock(day, block_start_ms):
     # --- Net flow: who's the aggressor? ---
     i_start_30, i_end_30 = _slice_window(ts, t_30, t0)
     if i_end_30 > i_start_30:
-        qty_slice = day.ft_qty[i_start_30:i_end_30]
-        ibm_slice = day.ft_ibm[i_start_30:i_end_30]
+        qty_slice = day.tf_qty[i_start_30:i_end_30]
+        ibm_slice = day.tf_ibm[i_start_30:i_end_30]
         buy_vol = qty_slice[~ibm_slice].sum()   # is_buyer_maker=False → buyer is taker
         sell_vol = qty_slice[ibm_slice].sum()    # is_buyer_maker=True → seller is taker
         total = buy_vol + sell_vol
@@ -1266,8 +1266,8 @@ def compute_preblock(day, block_start_ms):
 
     i_start_10, i_end_10 = _slice_window(ts, t_10, t0)
     if i_end_10 > i_start_10:
-        qty_slice = day.ft_qty[i_start_10:i_end_10]
-        ibm_slice = day.ft_ibm[i_start_10:i_end_10]
+        qty_slice = day.tf_qty[i_start_10:i_end_10]
+        ibm_slice = day.tf_ibm[i_start_10:i_end_10]
         buy_vol = qty_slice[~ibm_slice].sum()
         sell_vol = qty_slice[ibm_slice].sum()
         total = buy_vol + sell_vol
@@ -1332,7 +1332,7 @@ def compute_preblock(day, block_start_ms):
         liq_vol = day.lq_qty[li_s:li_e].sum() if li_e > li_s else 0.0
         # Total trade volume in last 60s
         ti_s, ti_e = _slice_window(ts, t_60, t0)
-        trade_vol = day.ft_qty[ti_s:ti_e].sum() if ti_e > ti_s else 0.0
+        trade_vol = day.tf_qty[ti_s:ti_e].sum() if ti_e > ti_s else 0.0
         f["pb_liq_pressure_60s"] = float(liq_vol / trade_vol) if trade_vol > 0 else 0.0
     else:
         f["pb_liq_pressure_60s"] = 0.0
