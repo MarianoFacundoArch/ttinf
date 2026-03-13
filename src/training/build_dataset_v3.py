@@ -1,12 +1,12 @@
 """
-Build V3 training dataset: 1 sample per 5 seconds within each 5-minute block.
+Build V3 training dataset: 1 sample per second within each 5-minute block.
 
 For each block (multiple of 300s):
   - Fixes open_ref = last ref_price <= block_start
   - Fixes close_ref = last ref_price <= block_end
   - Target: 1 if close_ref >= open_ref (Up), 0 if not (Down)
-  - Generates 1 row every 5s (60 rows per block)
-  - Computes ~84 features per row
+  - Generates 1 row every 1s (300 rows per block)
+  - Computes ~154 features per row
 
 Loads 30 min from previous day + 5 min from next day for border blocks.
 
@@ -46,8 +46,8 @@ DATA_DIR   = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "dataset_v3"
 
 BLOCK_DURATION_MS = 300_000  # 5 minutes
-SAMPLE_INTERVAL_MS = 5_000   # 1 row every 5 seconds
-ROWS_PER_BLOCK = BLOCK_DURATION_MS // SAMPLE_INTERVAL_MS  # 60
+SAMPLE_INTERVAL_MS = 1_000   # 1 row every 1 second
+ROWS_PER_BLOCK = BLOCK_DURATION_MS // SAMPLE_INTERVAL_MS  # 300
 
 # Output columns
 # seconds_to_expiry is already in FEATURE_COLUMNS_V3, so exclude from meta

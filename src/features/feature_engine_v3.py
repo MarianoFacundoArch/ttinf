@@ -1687,6 +1687,121 @@ def compute_ob_delta(day, T_ms, block_start_ms, block_cache=None):
 
 
 # ---------------------------------------------------------------------------
+# GROUP Q: Micro-tick features (8 features) — 1-second resolution signals
+#
+# Designed for 1s sampling. Capture immediate price velocity, momentum
+# consistency, trade bursts, and orderbook micro-changes.
+# ---------------------------------------------------------------------------
+
+MICRO_TICK_COLUMNS = [
+    "return_1s",                # Price return in last 1 second (bps)
+    "return_consistency_5s",    # Fraction of last 5 1s-returns in same direction [0,1]
+    "micro_acceleration",       # return_1s vs avg 1s return over 5s
+    "realized_vol_3s",          # Std of 1s returns over last 3s (bps)
+    "basis_delta_1s",           # Basis change in last 1 second (bps)
+    "trade_burst_1s",           # Trades in last 1s / avg per second in 30s
+    "ob_imbalance_change_1s",   # Imbalance L5 now vs 1s ago
+    "ob_imbalance_change_5s",   # Imbalance L5 now vs 5s ago
+]
+
+
+def compute_micro_tick(day, ref, T_ms):
+    """Ultra-short-term features at 1-second resolution."""
+    f = {}
+
+    # --- return_1s: price return in last 1 second ---
+    ref_idx = _last_before(ref['ts'], T_ms)
+    ref_idx_1 = _last_before(ref['ts'], T_ms - 1_000)
+    if ref_idx >= 0 and ref_idx_1 >= 0 and ref['price'][ref_idx_1] > 0:
+        ref_now = ref['price'][ref_idx]
+        ref_1s = ref['price'][ref_idx_1]
+        f["return_1s"] = float(_safe_div(ref_now - ref_1s, ref_1s) * 10_000)
+    else:
+        f["return_1s"] = 0.0
+
+    # --- return_consistency_5s + micro_acceleration ---
+    # Compute 1s returns for each of the last 5 seconds
+    returns_1s = []
+    for lag in range(5):
+        t_end = T_ms - lag * 1000
+        t_start = t_end - 1000
+        i_end = _last_before(ref['ts'], t_end)
+        i_start = _last_before(ref['ts'], t_start)
+        if i_end >= 0 and i_start >= 0 and ref['price'][i_start] > 0:
+            r = _safe_div(ref['price'][i_end] - ref['price'][i_start],
+                          ref['price'][i_start]) * 10_000
+            returns_1s.append(r)
+        else:
+            returns_1s.append(0.0)
+
+    if len(returns_1s) >= 5:
+        # Consistency: fraction of returns in same direction as most recent
+        latest_dir = 1 if returns_1s[0] >= 0 else -1
+        same_dir = sum(1 for r in returns_1s if (r >= 0) == (latest_dir >= 0))
+        f["return_consistency_5s"] = same_dir / 5.0
+
+        # Acceleration: latest return vs average of all 5
+        avg_return = sum(returns_1s) / 5.0
+        f["micro_acceleration"] = returns_1s[0] - avg_return
+    else:
+        f["return_consistency_5s"] = 0.5
+        f["micro_acceleration"] = 0.0
+
+    # --- realized_vol_3s: std of 1s returns over last 3 seconds ---
+    if len(returns_1s) >= 3:
+        vol_3s = np.std(returns_1s[:3])
+        f["realized_vol_3s"] = float(vol_3s)
+    else:
+        f["realized_vol_3s"] = 0.0
+
+    # --- basis_delta_1s: basis change in last 1 second ---
+    si = _last_before(day.bs_ts, T_ms)
+    fi = _last_before(day.bf_ts, T_ms)
+    si_1 = _last_before(day.bs_ts, T_ms - 1_000)
+    fi_1 = _last_before(day.bf_ts, T_ms - 1_000)
+    if si >= 0 and fi >= 0 and si_1 >= 0 and fi_1 >= 0:
+        basis_now = _safe_div(day.bf_mid[fi] - day.bs_mid[si], day.bs_mid[si]) * 10_000
+        basis_1s = _safe_div(day.bf_mid[fi_1] - day.bs_mid[si_1], day.bs_mid[si_1]) * 10_000
+        f["basis_delta_1s"] = basis_now - basis_1s
+    else:
+        f["basis_delta_1s"] = 0.0
+
+    # --- trade_burst_1s: trades in last 1s / avg per second in 30s ---
+    ts = day.tf_ts
+    i0_1, i1_1 = _slice_window(ts, T_ms - 1_000, T_ms)
+    i0_30, i1_30 = _slice_window(ts, T_ms - 30_000, T_ms)
+    n_trades_1s = i1_1 - i0_1
+    n_trades_30s = i1_30 - i0_30
+    avg_per_sec = n_trades_30s / 30.0 if n_trades_30s > 0 else 1.0
+    burst = float(n_trades_1s / avg_per_sec) if avg_per_sec > 0 else 1.0
+    f["trade_burst_1s"] = min(20.0, burst)
+
+    # --- ob_imbalance_change_1s and _5s ---
+    ob = day.ob_fut
+    if len(ob['ts']) > 0:
+        idx_now = _last_before(ob['ts'], T_ms)
+        idx_1s = _last_before(ob['ts'], T_ms - 1_000)
+        idx_5s = _last_before(ob['ts'], T_ms - 5_000)
+
+        imb_now = float(ob['imb_L5'][idx_now]) if idx_now >= 0 else 0.0
+
+        if idx_1s >= 0:
+            f["ob_imbalance_change_1s"] = imb_now - float(ob['imb_L5'][idx_1s])
+        else:
+            f["ob_imbalance_change_1s"] = 0.0
+
+        if idx_5s >= 0:
+            f["ob_imbalance_change_5s"] = imb_now - float(ob['imb_L5'][idx_5s])
+        else:
+            f["ob_imbalance_change_5s"] = 0.0
+    else:
+        f["ob_imbalance_change_1s"] = 0.0
+        f["ob_imbalance_change_5s"] = 0.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # GROUP K: Cross-exchange features (Ronda 1: 6 quotes + Ronda 2: 4 trades)
 # ---------------------------------------------------------------------------
 
@@ -2083,6 +2198,9 @@ def _build_feature_columns():
     # Group P: Orderbook delta since block start (3)
     cols += OB_DELTA_COLUMNS
 
+    # Group Q: Micro-tick features (8)
+    cols += MICRO_TICK_COLUMNS
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -2201,5 +2319,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group P: Orderbook delta since block start (dynamic, caches start snapshot)
     feats.update(compute_ob_delta(day, T_ms, block_start_ms, block_cache=block_cache))
+
+    # Group Q: Micro-tick features (dynamic, 1s resolution)
+    feats.update(compute_micro_tick(day, ref, T_ms))
 
     return feats
