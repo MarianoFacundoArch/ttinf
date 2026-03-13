@@ -28,6 +28,9 @@ Thumbs.db
 # Claude
 .claude/
 
+# Compiled binaries
+tools/book_builder
+
 # Misc
 *.log
 *.tmp
