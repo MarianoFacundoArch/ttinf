@@ -74,6 +74,7 @@ BROWNIAN_FEATURES = ["brownian_prob", "brownian_prob_drift"]
 def compute_init_score(df):
     """Compute init_score = logit(brownian_prob_drift) for residual training."""
     p = df["brownian_prob_drift"].values.astype(float)
+    p = np.where(np.isfinite(p), p, 0.5)  # NaN/Inf → 0.5 (neutral)
     p = np.clip(p, 1e-4, 1 - 1e-4)
     return np.log(p / (1 - p))  # logit
 
@@ -326,7 +327,8 @@ def predict_with_init_score(model, X, init_score=None):
     if init_score is not None:
         raw_margin = model.predict(X, raw_score=True)
         logits = init_score + raw_margin
-        return 1.0 / (1.0 + np.exp(-logits))
+        proba = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+        return np.nan_to_num(proba, nan=0.5)
     return model.predict(X)
 
 

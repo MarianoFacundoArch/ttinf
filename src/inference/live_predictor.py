@@ -163,6 +163,8 @@ class LivePredictor:
         # Predict (residual mode: add brownian logit back)
         if self.residual_mode:
             brownian_p = feats.get("brownian_prob_drift", feats.get("brownian_prob", 0.5))
+            if not np.isfinite(brownian_p):
+                brownian_p = 0.5
             brownian_p = np.clip(brownian_p, 1e-4, 1 - 1e-4)
             init_score = np.log(brownian_p / (1 - brownian_p))
             raw_margin = float(self.model.predict(X, raw_score=True)[0])
