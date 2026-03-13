@@ -21,9 +21,16 @@ Usage:
     features = compute_features_v3(day, ref, T_ms, block_start_ms, open_ref)
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+
+# np.corrcoef warns when std=0 (constant prices). We handle this with
+# np.isfinite checks, so silence the expected warning.
+warnings.filterwarnings("ignore", message="invalid value encountered in divide",
+                        category=RuntimeWarning, module="numpy")
 from pathlib import Path
 from scipy.stats import norm
 
