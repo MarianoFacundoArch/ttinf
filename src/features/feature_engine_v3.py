@@ -1537,6 +1537,156 @@ def compute_micro_dynamics(day, ref, T_ms, open_ref):
 
 
 # ---------------------------------------------------------------------------
+# GROUP O: Intra-block flow (3 features) — pure flow since block_start
+#
+# Unlike fut_buy_pct_30s which looks back 30s (crossing block boundary at
+# start), these measure flow ONLY within the current block.
+# ---------------------------------------------------------------------------
+
+INTRA_BLOCK_COLUMNS = [
+    "ib_buy_pct",           # buy_vol / total_vol since block_start
+    "ib_signed_vol_z",      # signed vol since block_start, normalized by 60s std
+    "ib_volume_rate_ratio", # volume rate in-block vs pre-block 60s
+]
+
+
+def compute_intra_block_flow(day, T_ms, block_start_ms):
+    """Flow features computed purely within the current block."""
+    f = {}
+
+    ts = day.tf_ts
+    qty = day.tf_qty
+    ibm = day.tf_ibm
+
+    # Trades since block_start
+    i0, i1 = _slice_window(ts, block_start_ms, T_ms)
+    elapsed_s = max(1.0, (T_ms - block_start_ms) / 1000.0)
+
+    if i1 - i0 > 0:
+        q = qty[i0:i1]
+        ib = ibm[i0:i1]
+        total = q.sum()
+        buy_vol = q[~ib].sum()
+
+        # Feature 1: buy percentage since block start
+        f["ib_buy_pct"] = float(_safe_div(buy_vol, total, 0.5))
+
+        # Feature 2: signed volume z-score (normalized by 60s std)
+        signed_vol = np.where(ib, -q, q)
+        total_signed = float(signed_vol.sum())
+
+        # Get 60s std for normalization
+        i0_60, i1_60 = _slice_window(ts, T_ms - 60_000, T_ms)
+        if i1_60 - i0_60 > 10:
+            ts_60 = ts[i0_60:i1_60]
+            q_60 = qty[i0_60:i1_60]
+            ibm_60 = ibm[i0_60:i1_60]
+            sv_60 = np.where(ibm_60, -q_60, q_60)
+            sec_buckets = ((ts_60 - ts_60[0]) // 1000).astype(np.intp)
+            n_secs = int(sec_buckets[-1]) + 1 if len(sec_buckets) > 0 else 0
+            if n_secs > 2:
+                sv_per_sec = np.bincount(sec_buckets, weights=sv_60, minlength=n_secs)
+                nonempty = np.bincount(sec_buckets, minlength=n_secs) > 0
+                sv_std = float(np.std(sv_per_sec[nonempty])) if nonempty.sum() > 2 else 0.0
+            else:
+                sv_std = 0.0
+            z = float(_safe_div(total_signed, sv_std)) if sv_std > 0 else 0.0
+            f["ib_signed_vol_z"] = max(-10.0, min(10.0, z))
+        else:
+            f["ib_signed_vol_z"] = 0.0
+
+        # Feature 3: volume rate ratio (in-block rate vs pre-block 60s rate)
+        ib_rate = float(total) / elapsed_s
+        i0_pre, i1_pre = _slice_window(ts, block_start_ms - 60_000, block_start_ms)
+        if i1_pre > i0_pre:
+            pre_rate = float(qty[i0_pre:i1_pre].sum()) / 60.0
+            ratio = float(_safe_div(ib_rate, pre_rate, 1.0))
+            f["ib_volume_rate_ratio"] = min(10.0, ratio)
+        else:
+            f["ib_volume_rate_ratio"] = 1.0
+    else:
+        f["ib_buy_pct"] = 0.5
+        f["ib_signed_vol_z"] = 0.0
+        f["ib_volume_rate_ratio"] = 1.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
+# GROUP P: Orderbook delta since block start (3 features)
+#
+# Captures how the orderbook CHANGED since block open — not the static
+# snapshot but the direction of book pressure evolution.
+# ---------------------------------------------------------------------------
+
+OB_DELTA_COLUMNS = [
+    "ob_imbalance_delta",    # imbalance L5 now vs at block_start
+    "ob_bid_depth_delta",    # bid volume now / bid volume at block_start
+    "ob_spread_delta_bps",   # spread now vs at block_start
+]
+
+
+def compute_ob_delta(day, T_ms, block_start_ms, block_cache=None):
+    """Orderbook change features since block start.
+
+    Caches the block_start OB snapshot for reuse within the block.
+    """
+    f = {}
+    ob = day.ob_fut
+
+    has_raw = ('bid_prices' in ob and len(ob['bid_prices']) > 0 and len(ob['ts']) > 0)
+
+    if not has_raw:
+        f["ob_imbalance_delta"] = 0.0
+        f["ob_bid_depth_delta"] = 1.0
+        f["ob_spread_delta_bps"] = 0.0
+        return f
+
+    # Get or cache block_start OB snapshot
+    if block_cache is not None and 'ob_start' in block_cache:
+        start_imb = block_cache['ob_start']['imb_L5']
+        start_bid_vol = block_cache['ob_start']['bid_vol']
+        start_spread = block_cache['ob_start']['spread_bps']
+    else:
+        idx_start = _last_before(ob['ts'], block_start_ms)
+        if idx_start >= 0:
+            start_imb = float(ob['imb_L5'][idx_start])
+            bp_s = ob['bid_qtys'][idx_start]
+            start_bid_vol = float(bp_s[ob['bid_prices'][idx_start] > 0].sum())
+            start_spread = float(ob['spread_bps'][idx_start])
+        else:
+            start_imb = 0.0
+            start_bid_vol = 0.0
+            start_spread = 0.0
+
+        if block_cache is not None:
+            block_cache['ob_start'] = {
+                'imb_L5': start_imb,
+                'bid_vol': start_bid_vol,
+                'spread_bps': start_spread,
+            }
+
+    # Current OB snapshot
+    idx_now = _last_before(ob['ts'], T_ms)
+    if idx_now >= 0:
+        now_imb = float(ob['imb_L5'][idx_now])
+        bp_n = ob['bid_qtys'][idx_now]
+        now_bid_vol = float(bp_n[ob['bid_prices'][idx_now] > 0].sum())
+        now_spread = float(ob['spread_bps'][idx_now])
+
+        f["ob_imbalance_delta"] = now_imb - start_imb
+        depth_ratio = float(_safe_div(now_bid_vol, start_bid_vol, 1.0))
+        f["ob_bid_depth_delta"] = min(10.0, max(0.1, depth_ratio))
+        f["ob_spread_delta_bps"] = now_spread - start_spread
+    else:
+        f["ob_imbalance_delta"] = 0.0
+        f["ob_bid_depth_delta"] = 1.0
+        f["ob_spread_delta_bps"] = 0.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # GROUP K: Cross-exchange features (Ronda 1: 6 quotes + Ronda 2: 4 trades)
 # ---------------------------------------------------------------------------
 
@@ -1769,6 +1919,32 @@ def compute_cross_exchange(day, T_ms, open_ref=0.0):
     else:
         f['cross_imbalance_consensus'] = np.nan
 
+    # === RONDA 4: Divergence velocity ===
+    # Is the cross-exchange divergence growing or closing?
+
+    # Coinbase divergence velocity
+    ci_5 = _last_before(day.cb_ts, T_ms - 5_000)
+    bi_5 = _last_before(day.bs_ts, T_ms - 5_000)
+    if ci >= 0 and ci_5 >= 0 and bi >= 0 and bi_5 >= 0:
+        cb_div_now = _safe_div(day.cb_mid[ci] - day.bs_mid[bi],
+                               day.bs_mid[bi]) * 10_000
+        cb_div_5s = _safe_div(day.cb_mid[ci_5] - day.bs_mid[bi_5],
+                              day.bs_mid[bi_5]) * 10_000
+        f['cb_divergence_velocity'] = cb_div_now - cb_div_5s
+    else:
+        f['cb_divergence_velocity'] = np.nan
+
+    # Bybit divergence velocity
+    bbi_5 = _last_before(day.bb_ts, T_ms - 5_000)
+    if bbi >= 0 and bbi_5 >= 0 and bi >= 0 and bi_5 >= 0:
+        bb_div_now = _safe_div(day.bb_mid[bbi] - day.bs_mid[bi],
+                               day.bs_mid[bi]) * 10_000
+        bb_div_5s = _safe_div(day.bb_mid[bbi_5] - day.bs_mid[bi_5],
+                              day.bs_mid[bi_5]) * 10_000
+        f['bb_divergence_velocity'] = bb_div_now - bb_div_5s
+    else:
+        f['bb_divergence_velocity'] = np.nan
+
     return f
 
 
@@ -1785,6 +1961,8 @@ CROSS_EXCHANGE_COLUMNS = [
     "cb_imbalance_L5", "bb_imbalance_L5",
     "cb_ob_near_open", "bb_ob_near_open",
     "cross_imbalance_consensus",
+    # Ronda 4: divergence velocity
+    "cb_divergence_velocity", "bb_divergence_velocity",
 ]
 
 
@@ -1899,6 +2077,12 @@ def _build_feature_columns():
     # Group N: Market microstructure dynamics (4)
     cols += MICRO_DYNAMICS_COLUMNS
 
+    # Group O: Intra-block flow (3)
+    cols += INTRA_BLOCK_COLUMNS
+
+    # Group P: Orderbook delta since block start (3)
+    cols += OB_DELTA_COLUMNS
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -2011,5 +2195,11 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group N: Market microstructure dynamics (dynamic)
     feats.update(compute_micro_dynamics(day, ref, T_ms, open_ref))
+
+    # Group O: Intra-block flow (dynamic)
+    feats.update(compute_intra_block_flow(day, T_ms, block_start_ms))
+
+    # Group P: Orderbook delta since block start (dynamic, caches start snapshot)
+    feats.update(compute_ob_delta(day, T_ms, block_start_ms, block_cache=block_cache))
 
     return feats

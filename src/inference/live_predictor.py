@@ -45,6 +45,7 @@ class LivePredictor:
         self.open_ref = 0.0
         self.open_ref_age_ms = 0
         self.block_results = []  # list of {'return_bps': float, 'result': int}
+        self.block_cache = {}  # cache static features within a block
 
     def _get_block_start(self, now_ms):
         """Get the deterministic block start for a given timestamp."""
@@ -87,6 +88,7 @@ class LivePredictor:
 
         # Set new block
         self.current_block_start_ms = block_start
+        self.block_cache = {}  # reset cache for new block
 
         # Find open_ref: last ref_price <= block_start
         if len(ref['ts']) > 0:
@@ -137,11 +139,12 @@ class LivePredictor:
         block_end = block_start + 300_000
         seconds_to_expiry = max(0, (block_end - now_ms) / 1000.0)
 
-        # Compute features
+        # Compute features (block_cache avoids recomputing static features)
         feats = compute_features_v3(
             day, ref, now_ms, block_start, self.open_ref,
             open_ref_age_ms=self.open_ref_age_ms,
             block_results=self.block_results,
+            block_cache=self.block_cache,
         )
 
         # Build feature vector
