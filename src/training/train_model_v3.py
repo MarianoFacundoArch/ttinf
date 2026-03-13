@@ -180,6 +180,13 @@ FEATURE_GROUPS = {
         "pb_trade_intensity", "pb_vol_30s", "pb_vol_ratio",
         "pb_liq_pressure_60s",
     ],
+    "theoretical": [
+        "hurst_exponent_30s", "ou_reversion_speed", "ou_half_life",
+        "variance_ratio_5s_1s", "shannon_entropy_30s",
+        "skew_ret_30s", "kurt_ret_30s", "dist_to_round_number_bps",
+        "microprice_vs_mid_bps", "amihud_illiquidity_30s",
+        "vol_of_vol_60s", "absret_acf_lag1", "obv_norm", "bounce_count_open",
+    ],
 }
 
 

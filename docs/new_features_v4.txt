@@ -1,0 +1,209 @@
+NEW FEATURES V4 — Theoretical & Statistical Features
+=====================================================
+
+14 new features to add on top of existing 154.
+Total after implementation: 168 features.
+
+All computable from existing data (trades, orderbook, prices).
+All available in live websocket inference.
+
+=============================================================================
+#1  hurst_exponent (30s window)
+=============================================================================
+What: Exponente de Hurst calculado sobre retornos de 1s en los últimos 30s.
+Why:  Mide si el precio está en modo trending (H>0.5) o mean-reverting (H<0.5).
+      H=0.5 = random walk (brownian puro). H=0.7 = momentum fuerte.
+      H=0.3 = el precio tiende a revertir.
+      Complementa brownian_prob: brownian asume H=0.5 siempre, pero en
+      realidad H varía segundo a segundo.
+How:  Rescaled range (R/S) method sobre ventana de 30 retornos de 1s.
+      Alternativa más rápida: variance ratio proxy → H = log(VR)/log(2)/2 + 0.5
+Range: [0, 1]. Typical: 0.3-0.7.
+
+=============================================================================
+#2  ou_mean_reversion_speed (60s window)
+=============================================================================
+What: Velocidad de reversión a la media del proceso Ornstein-Uhlenbeck.
+Why:  Brownian asume que el precio camina libre. OU agrega una fuerza que lo
+      tira hacia el open. Si la velocidad es alta, el precio tiende a volver
+      al open (bueno para UP si estás abajo, malo para UP si estás arriba).
+      Ninguna feature actual mide esto.
+How:  Regresión lineal de dx(t) vs x(t) donde x = precio - open.
+      theta = -slope. Si theta > 0, hay mean reversion.
+      Usar retornos de 1s sobre ventana de 60s.
+Range: [-5, 5]. Clipped. Positive = mean-reverting, negative = trending away.
+
+=============================================================================
+#3  ou_half_life (derived from #2)
+=============================================================================
+What: Tiempo estimado (en segundos) para que el precio recorra la mitad de
+      la distancia hacia el open.
+Why:  Más intuitivo que ou_speed. Si half_life = 10s y quedan 200s, hay
+      tiempo de sobra para revertir. Si half_life = 500s, no va a revertir.
+How:  half_life = ln(2) / theta. Si theta <= 0, half_life = 999 (no revierte).
+Range: [0.1, 999]. Clipped.
+
+=============================================================================
+#4  variance_ratio (5s vs 30s)
+=============================================================================
+What: Cociente entre la varianza de retornos a 5s y la varianza de retornos
+      a 1s escalada por 5.
+Why:  Si el mercado es random walk, VR = 1. Si VR > 1, hay momentum
+      (los retornos persisten). Si VR < 1, hay mean reversion.
+      realized_vol_10s/30s/60s son volatilidades individuales, no el cociente.
+How:  VR = Var(ret_5s) / (5 * Var(ret_1s)), usando ventana de 30s.
+Range: [0.1, 5.0]. Clipped. 1.0 = random walk.
+
+=============================================================================
+#5  shannon_entropy_returns (30s window)
+=============================================================================
+What: Entropía de Shannon de los retornos de 1s discretizados en bins.
+Why:  Mide el desorden/predictibilidad del flujo de precios. Baja entropía =
+      movimiento direccional claro. Alta entropía = ruido puro.
+      Diferente a buy_pct: entropía mide la DISTRIBUCIÓN completa, no solo
+      el ratio compra/venta.
+How:  Discretizar 30 retornos de 1s en 5 bins (muy negativo, negativo, neutro,
+      positivo, muy positivo). Calcular H = -sum(p_i * log(p_i)).
+      Normalizar por log(5) para tener rango [0, 1].
+Range: [0, 1]. 0 = totalmente predecible. 1 = máximo desorden.
+
+=============================================================================
+#6  skew_ret_30s
+=============================================================================
+What: Asimetría (skewness) de los retornos de 1s en los últimos 30s.
+Why:  Skew positivo = más movimientos alcistas extremos.
+      Skew negativo = más movimientos bajistas extremos.
+      Ninguna feature actual captura la forma de la distribución, solo
+      medidas de centro (returns) y dispersión (vol).
+How:  scipy.stats.skew sobre 30 retornos de 1s. Clip a [-5, 5].
+Range: [-5, 5]. 0 = simétrico.
+
+=============================================================================
+#7  kurt_ret_30s
+=============================================================================
+What: Curtosis (excess kurtosis) de los retornos de 1s en los últimos 30s.
+Why:  Curtosis alta = colas pesadas = mayor probabilidad de movimientos
+      extremos. Indica régimen de volatilidad y riesgo de reversals bruscos.
+How:  scipy.stats.kurtosis (Fisher, excess) sobre 30 retornos. Clip a [0, 20].
+Range: [0, 20]. 0 = normal. >3 = colas pesadas.
+
+=============================================================================
+#8  dist_to_round_number_bps
+=============================================================================
+What: Distancia del precio actual al número redondo más cercano, en bps.
+Why:  Los números redondos (100000, 95000, 90000, etc.) actúan como niveles
+      psicológicos. Los traders ponen órdenes ahí, creando soporte/resistencia.
+      El precio absoluto no entra como feature actualmente.
+How:  Definir niveles redondos: múltiplos de 1000 y 5000.
+      dist = min(|price - level|) / price * 10000.
+      También: flag de si el open está entre el precio y el nivel redondo
+      (el nivel podría actuar como barrera para llegar al open).
+Range: [0, ~500 bps]. Typical: 0-100 bps.
+
+=============================================================================
+#9  microprice_minus_midprice_bps
+=============================================================================
+What: Microprecio menos midprice, en bps.
+      Microprice = (bid * ask_vol + ask * bid_vol) / (bid_vol + ask_vol)
+Why:  Cuando microprice > midprice, hay más volumen en el bid que en el ask,
+      lo que indica presión compradora implícita. Es una señal de dirección
+      a muy corto plazo derivada del orderbook.
+      Diferente a imbalance_L1: microprice pondera por precio, no solo volumen.
+How:  microprice = (best_bid * ask_qty + best_ask * bid_qty) / (bid_qty + ask_qty)
+      feature = (microprice - midprice) / midprice * 10000
+Range: [-5, 5] bps typically.
+
+=============================================================================
+#10  amihud_illiquidity (30s window)
+=============================================================================
+What: Ratio de Amihud: |return| / volume over 30s.
+Why:  Mide la fragilidad del mercado. Alto = poco volumen mueve mucho el precio
+      = mercado frágil, más riesgo. Bajo = mercado profundo, estable.
+      Kyle's lambda (price_impact_30s) mide algo similar pero con signed volume.
+      Amihud usa absolute return / total volume, es más simple y robusto.
+How:  amihud = |return_30s| / total_volume_30s. Normalizar o log-transform.
+Range: [0, inf]. Log-transform recommended. Clip extremes.
+
+=============================================================================
+#11  vol_of_vol (60s window)
+=============================================================================
+What: Desviación estándar de realized_vol_10s calculada cada 10s, sobre 60s.
+Why:  Si la volatilidad es estable, el modelo puede confiar en sus estimados.
+      Si la volatilidad cambia rápido (vol_of_vol alto), hay incertidumbre
+      sobre el régimen actual. Indica transiciones de régimen.
+How:  Calcular realized_vol_10s en t, t-10, t-20, t-30, t-40, t-50.
+      vol_of_vol = std de esos 6 valores.
+Range: [0, inf]. Clip to [0, 50].
+
+=============================================================================
+#12  absret_acf_lag1 (30s window)
+=============================================================================
+What: Autocorrelación de |retornos de 1s| con lag 1, sobre ventana de 30s.
+Why:  Mide clustering de volatilidad. Si absret_acf > 0, un retorno grande
+      tiende a ser seguido por otro retorno grande (mismo o distinto signo).
+      Esto es el efecto ARCH/GARCH clásico.
+      return_autocorr_30s mide autocorrelación de retornos (dirección),
+      esto mide autocorrelación de MAGNITUDES.
+How:  np.corrcoef(|ret[:-1]|, |ret[1:]|)[0,1] sobre 30 valores.
+Range: [-1, 1]. Typical: 0.0-0.5.
+
+=============================================================================
+#13  on_balance_volume_norm (since block start)
+=============================================================================
+What: OBV normalizado desde inicio del bloque.
+      OBV acumula volumen: +vol si el precio sube, -vol si baja.
+Why:  Indicador clásico de flujo. Si OBV sube pero el precio no, hay
+      acumulación (alcista). Si OBV baja pero precio no, hay distribución.
+      Diferente a cumulative_volume_delta_norm que usa buy/sell volume.
+      OBV usa la DIRECCIÓN del precio, no quién inició el trade.
+How:  Para cada segundo desde block_start: if price > prev_price, OBV += vol;
+      else OBV -= vol. Normalizar por volumen total.
+Range: [-1, 1].
+
+=============================================================================
+#14  bounce_count_at_open (since block start)
+=============================================================================
+What: Número de veces que el precio se acercó al open (dentro de X bps)
+      pero rebotó sin cruzar.
+Why:  Muchos rebotes = el open actúa como soporte/resistencia fuerte.
+      Si el precio rebota 4 veces en el open sin cruzar, es menos probable
+      que cruce. Si ya cruzó 5 veces fácilmente, el open no es barrera.
+      num_crosses_open cuenta cruces exitosos. bounce_count cuenta RECHAZOS.
+How:  Definir "cerca" como dentro de 1 bps del open. Contar eventos donde
+      el precio entra en la zona y sale sin cruzar al otro lado.
+      Alternativa: contar reversals dentro de 2 bps del open.
+Range: [0, ~20]. Integer.
+
+=============================================================================
+
+IMPLEMENTATION NOTES
+--------------------
+- All features use data already available in DayData / LiveBuffer
+- Websocket inference: all computable from trades + depth streams
+- Computation cost: most are O(window_size), Hurst is slightly more expensive
+- Add as Group R in feature_engine_v3.py
+- Feature column names for FEATURE_COLUMNS_V3:
+    hurst_exponent_30s
+    ou_reversion_speed
+    ou_half_life
+    variance_ratio_5s_1s
+    shannon_entropy_30s
+    skew_ret_30s
+    kurt_ret_30s
+    dist_to_round_number_bps
+    microprice_vs_mid_bps
+    amihud_illiquidity_30s
+    vol_of_vol_60s
+    absret_acf_lag1
+    obv_norm
+    bounce_count_open
+
+EXPECTED IMPACT
+---------------
+- Hurst + OU + variance_ratio: strongest candidates, complementary to brownian
+- shannon_entropy + skew + kurt: capture distribution shape, no current feature does
+- dist_to_round_number: unique psychological signal
+- microprice: refined orderbook pressure
+- amihud: market fragility
+- vol_of_vol + absret_acf: regime detection
+- obv + bounce_count: classic indicators that may or may not add over existing features

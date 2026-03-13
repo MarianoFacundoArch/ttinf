@@ -2089,6 +2089,314 @@ CROSS_EXCHANGE_COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
+# Group R: Theoretical & statistical features (14 features)
+# ---------------------------------------------------------------------------
+
+THEORETICAL_COLUMNS = [
+    "hurst_exponent_30s",
+    "ou_reversion_speed",
+    "ou_half_life",
+    "variance_ratio_5s_1s",
+    "shannon_entropy_30s",
+    "skew_ret_30s",
+    "kurt_ret_30s",
+    "dist_to_round_number_bps",
+    "microprice_vs_mid_bps",
+    "amihud_illiquidity_30s",
+    "vol_of_vol_60s",
+    "absret_acf_lag1",
+    "obv_norm",
+    "bounce_count_open",
+]
+
+
+def _get_1s_returns(ref, T_ms, n_seconds):
+    """Get array of 1-second returns (in bps) for the last n_seconds."""
+    returns = []
+    for lag in range(n_seconds):
+        t_end = T_ms - lag * 1000
+        t_start = t_end - 1000
+        i_end = _last_before(ref['ts'], t_end)
+        i_start = _last_before(ref['ts'], t_start)
+        if i_end >= 0 and i_start >= 0 and ref['price'][i_start] > 0:
+            r = _safe_div(ref['price'][i_end] - ref['price'][i_start],
+                          ref['price'][i_start]) * 10_000
+            returns.append(r)
+        else:
+            returns.append(0.0)
+    return np.array(returns)
+
+
+def compute_theoretical(day, ref, T_ms, block_start_ms, open_ref):
+    """Compute theoretical & statistical features (Group R)."""
+    f = {}
+
+    # Get 1-second returns for various windows
+    rets_30 = _get_1s_returns(ref, T_ms, 30)
+    rets_60 = _get_1s_returns(ref, T_ms, 60)
+
+    # ---------------------------------------------------------------
+    # #1 Hurst exponent (30s) via variance ratio proxy
+    # H = 0.5 * log2(VR) + 0.5, where VR = Var(5s) / (5 * Var(1s))
+    # ---------------------------------------------------------------
+    var_1s = np.var(rets_30) if len(rets_30) >= 5 else 0.0
+    if var_1s > 1e-12 and len(rets_30) >= 10:
+        # Build 5-second returns from non-overlapping blocks
+        rets_5s = []
+        for i in range(0, len(rets_30) - 4, 5):
+            rets_5s.append(np.sum(rets_30[i:i+5]))
+        var_5s = np.var(rets_5s) if len(rets_5s) >= 2 else 0.0
+        vr = var_5s / (5.0 * var_1s) if var_1s > 1e-12 else 1.0
+        vr = max(0.01, min(100.0, vr))  # clip
+        hurst = 0.5 * np.log2(vr) + 0.5
+        f["hurst_exponent_30s"] = float(np.clip(hurst, 0.0, 1.0))
+    else:
+        f["hurst_exponent_30s"] = 0.5  # default = random walk
+
+    # ---------------------------------------------------------------
+    # #2 OU mean reversion speed (60s window)
+    # Regress dx(t) on x(t) where x = price - open
+    # theta = -slope. Positive = mean-reverting.
+    # ---------------------------------------------------------------
+    if len(rets_60) >= 10:
+        # Build price path relative to open
+        prices = []
+        for lag in range(60, -1, -1):
+            idx = _last_before(ref['ts'], T_ms - lag * 1000)
+            if idx >= 0:
+                prices.append(ref['price'][idx] - open_ref)
+            elif prices:
+                prices.append(prices[-1])
+            else:
+                prices.append(0.0)
+        prices = np.array(prices)
+        if len(prices) >= 3:
+            dx = np.diff(prices)
+            x = prices[:-1]
+            # Simple regression: theta = -cov(dx, x) / var(x)
+            var_x = np.var(x)
+            if var_x > 1e-15:
+                cov_dx_x = np.mean((dx - dx.mean()) * (x - x.mean()))
+                theta = -cov_dx_x / var_x
+                f["ou_reversion_speed"] = float(np.clip(theta, -5.0, 5.0))
+            else:
+                f["ou_reversion_speed"] = 0.0
+        else:
+            f["ou_reversion_speed"] = 0.0
+    else:
+        f["ou_reversion_speed"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #3 OU half-life (derived from #2)
+    # half_life = ln(2) / theta. If theta <= 0, no reversion.
+    # ---------------------------------------------------------------
+    theta = f["ou_reversion_speed"]
+    if theta > 0.001:
+        f["ou_half_life"] = float(np.clip(np.log(2) / theta, 0.1, 999.0))
+    else:
+        f["ou_half_life"] = 999.0  # no reversion
+
+    # ---------------------------------------------------------------
+    # #4 Variance ratio (5s vs 1s)
+    # VR = Var(5s_returns) / (5 * Var(1s_returns))
+    # VR > 1 = momentum, VR < 1 = mean reversion, VR = 1 = random walk
+    # ---------------------------------------------------------------
+    if var_1s > 1e-12 and len(rets_30) >= 10:
+        # Reuse rets_5s from hurst calculation
+        rets_5s_vr = []
+        for i in range(0, len(rets_30) - 4, 5):
+            rets_5s_vr.append(np.sum(rets_30[i:i+5]))
+        var_5s_vr = np.var(rets_5s_vr) if len(rets_5s_vr) >= 2 else var_1s * 5
+        vr_val = var_5s_vr / (5.0 * var_1s)
+        f["variance_ratio_5s_1s"] = float(np.clip(vr_val, 0.1, 5.0))
+    else:
+        f["variance_ratio_5s_1s"] = 1.0
+
+    # ---------------------------------------------------------------
+    # #5 Shannon entropy of returns (30s)
+    # Discretize into 5 bins, compute normalized entropy.
+    # 0 = perfectly predictable, 1 = maximum disorder
+    # ---------------------------------------------------------------
+    if len(rets_30) >= 5 and np.std(rets_30) > 1e-10:
+        # Use fixed bins: very_neg, neg, neutral, pos, very_pos
+        std_r = np.std(rets_30)
+        bins = [-np.inf, -std_r, -std_r * 0.2, std_r * 0.2, std_r, np.inf]
+        counts = np.histogram(rets_30, bins=bins)[0]
+        probs = counts / counts.sum()
+        probs = probs[probs > 0]
+        entropy = -np.sum(probs * np.log(probs))
+        max_entropy = np.log(5)
+        f["shannon_entropy_30s"] = float(entropy / max_entropy) if max_entropy > 0 else 1.0
+    else:
+        f["shannon_entropy_30s"] = 1.0  # maximum uncertainty
+
+    # ---------------------------------------------------------------
+    # #6 Skewness of returns (30s)
+    # Positive = more extreme up moves. Negative = more extreme down moves.
+    # ---------------------------------------------------------------
+    if len(rets_30) >= 5 and np.std(rets_30) > 1e-10:
+        m3 = np.mean((rets_30 - np.mean(rets_30)) ** 3)
+        s3 = np.std(rets_30) ** 3
+        skew = m3 / s3 if s3 > 1e-15 else 0.0
+        f["skew_ret_30s"] = float(np.clip(skew, -5.0, 5.0))
+    else:
+        f["skew_ret_30s"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #7 Kurtosis of returns (30s) — excess kurtosis
+    # High = fat tails = extreme moves likely. 0 = normal distribution.
+    # ---------------------------------------------------------------
+    if len(rets_30) >= 5 and np.std(rets_30) > 1e-10:
+        m4 = np.mean((rets_30 - np.mean(rets_30)) ** 4)
+        s4 = np.std(rets_30) ** 4
+        kurt = (m4 / s4 - 3.0) if s4 > 1e-15 else 0.0
+        f["kurt_ret_30s"] = float(np.clip(kurt, 0.0, 20.0))
+    else:
+        f["kurt_ret_30s"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #8 Distance to nearest round number (bps)
+    # Round numbers: multiples of 1000 and 5000 in USD
+    # ---------------------------------------------------------------
+    ref_idx = _last_before(ref['ts'], T_ms)
+    price_now = ref['price'][ref_idx] if ref_idx >= 0 else open_ref
+    if price_now > 0:
+        # Find nearest multiples of 1000 and 5000
+        r1000 = round(price_now / 1000) * 1000
+        r5000 = round(price_now / 5000) * 5000
+        dist_1000 = abs(price_now - r1000) / price_now * 10_000
+        dist_5000 = abs(price_now - r5000) / price_now * 10_000
+        f["dist_to_round_number_bps"] = float(min(dist_1000, dist_5000))
+    else:
+        f["dist_to_round_number_bps"] = 999.0
+
+    # ---------------------------------------------------------------
+    # #9 Microprice minus midprice (bps)
+    # microprice = (bid * ask_vol + ask * bid_vol) / (bid_vol + ask_vol)
+    # Positive = bid-side pressure (bullish)
+    # ---------------------------------------------------------------
+    ob = day.ob_fut
+    if len(ob['ts']) > 0 and 'bid_prices' in ob and len(ob['bid_prices']) > 0:
+        oi = _last_before(ob['ts'], T_ms)
+        if oi >= 0:
+            bid = float(ob['bid_prices'][oi][0])
+            ask = float(ob['ask_prices'][oi][0])
+            bid_qty = float(ob['bid_qtys'][oi][0])
+            ask_qty = float(ob['ask_qtys'][oi][0])
+            mid = (bid + ask) / 2.0
+            total_qty = bid_qty + ask_qty
+            if total_qty > 0 and mid > 0:
+                microprice = (bid * ask_qty + ask * bid_qty) / total_qty
+                f["microprice_vs_mid_bps"] = float((microprice - mid) / mid * 10_000)
+            else:
+                f["microprice_vs_mid_bps"] = 0.0
+        else:
+            f["microprice_vs_mid_bps"] = 0.0
+    else:
+        f["microprice_vs_mid_bps"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #10 Amihud illiquidity (30s)
+    # |return_30s| / total_volume_30s. High = fragile market.
+    # ---------------------------------------------------------------
+    ret_30 = abs(float(np.sum(rets_30))) if len(rets_30) > 0 else 0.0
+    i0, i1 = _slice_window(day.tf_ts, T_ms - 30_000, T_ms)
+    total_vol = float(np.sum(day.tf_qty[i0:i1])) if i1 > i0 else 0.0
+    if total_vol > 1e-6:
+        amihud = ret_30 / total_vol
+        f["amihud_illiquidity_30s"] = float(np.clip(np.log1p(amihud * 1e6), 0, 20))
+    else:
+        f["amihud_illiquidity_30s"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #11 Vol of vol (60s) — std of realized_vol_10s sampled every 10s
+    # High = regime instability
+    # ---------------------------------------------------------------
+    if len(rets_60) >= 30:
+        vols = []
+        for offset in range(0, 60, 10):
+            chunk = rets_60[offset:offset + 10]
+            if len(chunk) >= 5:
+                vols.append(float(np.std(chunk)))
+        if len(vols) >= 3:
+            f["vol_of_vol_60s"] = float(np.clip(np.std(vols), 0, 50))
+        else:
+            f["vol_of_vol_60s"] = 0.0
+    else:
+        f["vol_of_vol_60s"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #12 Autocorrelation of |returns| lag 1 (30s)
+    # Measures volatility clustering (ARCH effect)
+    # ---------------------------------------------------------------
+    if len(rets_30) >= 5:
+        abs_rets = np.abs(rets_30)
+        if np.std(abs_rets) > 1e-10:
+            corr = np.corrcoef(abs_rets[:-1], abs_rets[1:])[0, 1]
+            f["absret_acf_lag1"] = float(corr) if np.isfinite(corr) else 0.0
+        else:
+            f["absret_acf_lag1"] = 0.0
+    else:
+        f["absret_acf_lag1"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #13 On-balance volume normalized (since block start)
+    # OBV: +vol when price up, -vol when price down. Normalized [-1,1].
+    # Simplified: use 1-second price bars and aggregate volume per bar.
+    # ---------------------------------------------------------------
+    i0_block, i1_block = _slice_window(ref['ts'], block_start_ms, T_ms)
+    if i1_block - i0_block >= 2:
+        block_prices = ref['price'][i0_block:i1_block]
+        block_ts = ref['ts'][i0_block:i1_block]
+        # Compute OBV using ref price direction and trade volume in each 1s bar
+        obv = 0.0
+        total_v = 0.0
+        for i in range(1, len(block_prices)):
+            t0_bar = int(block_ts[i - 1])
+            t1_bar = int(block_ts[i])
+            ti0, ti1 = _slice_window(day.tf_ts, t0_bar, t1_bar)
+            vol_bar = float(np.sum(day.tf_qty[ti0:ti1])) if ti1 > ti0 else 0.0
+            total_v += vol_bar
+            if block_prices[i] > block_prices[i - 1]:
+                obv += vol_bar
+            elif block_prices[i] < block_prices[i - 1]:
+                obv -= vol_bar
+        f["obv_norm"] = float(obv / total_v) if total_v > 0 else 0.0
+    else:
+        f["obv_norm"] = 0.0
+
+    # ---------------------------------------------------------------
+    # #14 Bounce count at open (since block start)
+    # Count times price approached open (within 1 bps) but reversed
+    # without crossing. Many bounces = open is strong support/resistance.
+    # ---------------------------------------------------------------
+    if i1_block - i0_block >= 3 and open_ref > 0:
+        block_prices = ref['price'][i0_block:i1_block]
+        threshold_bps = 1.0
+        threshold_abs = open_ref * threshold_bps / 10_000
+        bounces = 0
+        in_zone = False
+        entered_side = 0  # 1 = from above, -1 = from below
+        for i in range(1, len(block_prices)):
+            dist = block_prices[i] - open_ref
+            near = abs(dist) <= threshold_abs
+            if near and not in_zone:
+                in_zone = True
+                entered_side = 1 if block_prices[i - 1] > open_ref else -1
+            elif not near and in_zone:
+                # Exited zone — check if same side as entry (= bounce)
+                exit_side = 1 if block_prices[i] > open_ref else -1
+                if exit_side == entered_side:
+                    bounces += 1
+                in_zone = False
+        f["bounce_count_open"] = float(min(bounces, 20))
+    else:
+        f["bounce_count_open"] = 0.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # Feature column list (programmatically generated)
 # ---------------------------------------------------------------------------
 
@@ -2207,6 +2515,9 @@ def _build_feature_columns():
 
     # Group Q: Micro-tick features (8)
     cols += MICRO_TICK_COLUMNS
+
+    # Group R: Theoretical & statistical (14)
+    cols += THEORETICAL_COLUMNS
 
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
@@ -2329,5 +2640,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group Q: Micro-tick features (dynamic, 1s resolution)
     feats.update(compute_micro_tick(day, ref, T_ms))
+
+    # Group R: Theoretical & statistical (dynamic)
+    feats.update(compute_theoretical(day, ref, T_ms, block_start_ms, open_ref))
 
     return feats
