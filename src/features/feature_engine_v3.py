@@ -529,13 +529,15 @@ def compute_microstructure(day, ref, T_ms):
             ibm_60 = ibm_arr[i0_60:i1_60]
             signed_60 = np.where(ibm_60, -q_60, q_60)  # buyer_maker=True → sell pressure
 
-            # Compute in 1-second buckets for std
+            # Compute in 1-second buckets for std (vectorized)
             ts_60 = ts_arr[i0_60:i1_60]
-            sec_buckets = (ts_60 - ts_60[0]) // 1000
-            unique_secs = np.unique(sec_buckets)
-            if len(unique_secs) > 2:
-                sv_per_sec = np.array([signed_60[sec_buckets == s].sum() for s in unique_secs])
-                sv_std = float(np.std(sv_per_sec))
+            sec_buckets = ((ts_60 - ts_60[0]) // 1000).astype(np.intp)
+            n_secs = int(sec_buckets[-1]) + 1 if len(sec_buckets) > 0 else 0
+            if n_secs > 2:
+                sv_per_sec = np.bincount(sec_buckets, weights=signed_60, minlength=n_secs)
+                # Only count non-empty buckets
+                nonempty = np.bincount(sec_buckets, minlength=n_secs) > 0
+                sv_std = float(np.std(sv_per_sec[nonempty])) if nonempty.sum() > 2 else 0.0
             else:
                 sv_std = 0.0
 
@@ -1040,56 +1042,54 @@ def compute_vpin(day, T_ms):
     def _vpin_from_trades(ts, qty, ibm, start_ms, end_ms, n_buckets=10):
         """Compute VPIN and signed VPIN from trades in a time window.
 
-        Divides trades into n_buckets equal-volume buckets, then measures
-        how one-sided each bucket is.
+        Proper implementation with trade splitting via np.interp:
+        buy/sell volumes are interpolated at exact bucket boundaries,
+        ensuring all volume is used and buckets are perfectly equal-volume.
         Returns (vpin, signed_vpin).
         """
         i0 = np.searchsorted(ts, start_ms, side='left')
         i1 = np.searchsorted(ts, end_ms, side='right')
         if i1 - i0 < 10:
-            return 0.0, 0.0
+            return np.nan, np.nan
 
         q = qty[i0:i1]
         is_bm = ibm[i0:i1]
         total_vol = q.sum()
         if total_vol <= 0:
-            return 0.0, 0.0
+            return np.nan, np.nan
 
         bucket_vol = total_vol / n_buckets
         if bucket_vol <= 0:
-            return 0.0, 0.0
+            return np.nan, np.nan
 
-        # Accumulate into volume buckets
-        cum_vol = 0.0
-        bucket_buy = 0.0
-        bucket_sell = 0.0
-        abs_imbalances = []
-        signed_imbalances = []
+        # Cumulative volumes at trade boundaries (the "x axis")
+        cum_total = np.cumsum(q)
+        cum_buy = np.cumsum(np.where(is_bm, 0.0, q))
+        # Prepend 0 for the origin point
+        vol_axis = np.empty(len(q) + 1)
+        vol_axis[0] = 0.0
+        vol_axis[1:] = cum_total
+        buy_axis = np.empty(len(q) + 1)
+        buy_axis[0] = 0.0
+        buy_axis[1:] = cum_buy
 
-        for j in range(i1 - i0):
-            trade_qty = q[j]
-            if is_bm[j]:
-                bucket_sell += trade_qty  # buyer is maker → taker sold
-            else:
-                bucket_buy += trade_qty   # taker bought
+        # Bucket boundaries at exact volume thresholds
+        # [bucket_vol, 2*bucket_vol, ..., n*bucket_vol]
+        thresholds = np.arange(1, n_buckets + 1) * bucket_vol
 
-            cum_vol += trade_qty
+        # Interpolate buy volume at each boundary
+        # np.interp does piecewise-linear interpolation = trade splitting
+        buy_at = np.interp(thresholds, vol_axis, buy_axis)
 
-            if cum_vol >= bucket_vol:
-                bkt_total = bucket_buy + bucket_sell
-                if bkt_total > 0:
-                    abs_imbalances.append(abs(bucket_buy - bucket_sell) / bkt_total)
-                    signed_imbalances.append((bucket_buy - bucket_sell) / bkt_total)
-                bucket_buy = 0.0
-                bucket_sell = 0.0
-                cum_vol = 0.0
+        # Buy/sell per bucket (prepend 0 for diff)
+        buy_per = np.diff(np.concatenate(([0.0], buy_at)))
+        sell_per = bucket_vol - buy_per  # total per bucket = bucket_vol
 
-        if not abs_imbalances:
-            return 0.0, 0.0
+        # Imbalances
+        abs_imb = np.abs(buy_per - sell_per) / bucket_vol
+        signed_imb = (buy_per - sell_per) / bucket_vol
 
-        vpin = float(np.mean(abs_imbalances))
-        signed_vpin = float(np.mean(signed_imbalances))
-        return vpin, signed_vpin
+        return float(abs_imb.mean()), float(signed_imb.mean())
 
     # VPIN over 30s (short-term)
     vpin_30, signed_30 = _vpin_from_trades(
@@ -1285,39 +1285,32 @@ def compute_preblock(day, block_start_ms):
     f["pb_trade_intensity"] = float(rate_30s / rate_5m) if rate_5m > 0 else 1.0
 
     # --- Realized vol last 30s (std of 1-second returns) ---
-    # Build 1-second price series in [t_30, t0]
+    # Build 1-second price series in [t_30, t0] (vectorized)
     if i_end_30 - i_start_30 > 10:
         ts_slice = ts[i_start_30:i_end_30]
         px_slice = prices[i_start_30:i_end_30]
-        # Sample at 1-second intervals
-        sec_prices = []
-        for sec in range(30):
-            sec_ms = t_30 + sec * 1000
-            idx = np.searchsorted(ts_slice, sec_ms, side='right') - 1
-            if idx >= 0:
-                sec_prices.append(px_slice[idx])
-        if len(sec_prices) > 2:
-            sec_prices = np.array(sec_prices)
+        sec_grid = np.arange(t_30, t0, 1000)
+        sec_idx = np.searchsorted(ts_slice, sec_grid, side='right') - 1
+        valid = sec_idx >= 0
+        if valid.sum() > 2:
+            sec_prices = px_slice[sec_idx[valid]]
             returns = np.diff(sec_prices) / sec_prices[:-1]
-            f["pb_vol_30s"] = float(np.std(returns)) * 10_000  # bps
+            f["pb_vol_30s"] = float(np.std(returns)) * 10_000
         else:
             f["pb_vol_30s"] = 0.0
     else:
         f["pb_vol_30s"] = 0.0
 
     # --- Vol ratio: vol_30s / vol_5min ---
-    # Compute 5min vol the same way
+    # Compute 5min vol the same way (vectorized)
     if i_end_5m - i_start_5m > 10:
         ts_5m_slice = ts[i_start_5m:i_end_5m]
         px_5m_slice = prices[i_start_5m:i_end_5m]
-        sec_prices_5m = []
-        for sec in range(0, 300, 5):  # 5-second intervals for efficiency
-            sec_ms = t_5m + sec * 1000
-            idx = np.searchsorted(ts_5m_slice, sec_ms, side='right') - 1
-            if idx >= 0:
-                sec_prices_5m.append(px_5m_slice[idx])
-        if len(sec_prices_5m) > 2:
-            sec_prices_5m = np.array(sec_prices_5m)
+        sec_grid_5m = np.arange(t_5m, t0, 5000)
+        sec_idx_5m = np.searchsorted(ts_5m_slice, sec_grid_5m, side='right') - 1
+        valid_5m = sec_idx_5m >= 0
+        if valid_5m.sum() > 2:
+            sec_prices_5m = px_5m_slice[sec_idx_5m[valid_5m]]
             returns_5m = np.diff(sec_prices_5m) / sec_prices_5m[:-1]
             vol_5m = float(np.std(returns_5m)) * 10_000
             f["pb_vol_ratio"] = f["pb_vol_30s"] / vol_5m if vol_5m > 0 else 1.0
@@ -1715,9 +1708,10 @@ FEATURE_COLUMNS_V3 = _build_feature_columns()
 # ---------------------------------------------------------------------------
 
 def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
-                        open_ref_age_ms=0, block_results=None):
+                        open_ref_age_ms=0, block_results=None,
+                        block_cache=None):
     """
-    Compute all ~87 features for timestamp T within a block.
+    Compute all ~132 features for timestamp T within a block.
 
     Args:
         day: DayData object
@@ -1728,6 +1722,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
         open_ref_age_ms: age of the open_ref data point in ms
         block_results: list of previous block results (most recent first),
                        each dict with 'return_bps' and 'result'
+        block_cache: optional dict, reused across rows of the same block
+                     to avoid recomputing static features (preblock, history)
 
     Returns:
         dict mapping feature name → float value
@@ -1737,10 +1733,10 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     feats = {}
 
-    # Group A: Block state
+    # Group A: Block state (dynamic — depends on T_ms)
     feats.update(compute_block_state(ref, T_ms, block_start_ms, open_ref))
 
-    # Group B: Microstructure
+    # Group B: Microstructure (dynamic)
     micro = compute_microstructure(day, ref, T_ms)
     # Compute block_vwap_vs_open_bps using open_ref
     vwap = micro.pop("_block_vwap", np.nan)
@@ -1750,37 +1746,49 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
         micro["block_vwap_vs_open_bps"] = 0.0
     feats.update(micro)
 
-    # Group C: Regime
+    # Group C: Regime (dynamic — liq features depend on T_ms)
     regime = compute_regime(day, T_ms)
     feats.update(regime)
 
-    # Group D: Block history
-    feats.update(compute_block_history(block_results))
+    # Group D: Block history (STATIC per block — cache)
+    if block_cache is not None and 'block_history' in block_cache:
+        feats.update(block_cache['block_history'])
+    else:
+        bh = compute_block_history(block_results)
+        feats.update(bh)
+        if block_cache is not None:
+            block_cache['block_history'] = bh
 
-    # Group E: Temporal
+    # Group E: Temporal (dynamic)
     temporal = compute_temporal(T_ms)
     feats.update(temporal)
     # minutes_to_funding already set by regime, temporal doesn't overwrite
 
-    # Group F: Data quality
+    # Group F: Data quality (dynamic)
     feats.update(compute_data_quality(day, T_ms, open_ref_age_ms))
 
-    # Group G: Derived / pre-computed
+    # Group G: Derived / pre-computed (dynamic)
     feats.update(compute_derived(feats, ref, T_ms, block_start_ms))
 
-    # Group H: Flow dynamics
+    # Group H: Flow dynamics (dynamic)
     feats.update(compute_flow_dynamics(day, T_ms, block_start_ms))
 
-    # Group I: Orderbook at open
+    # Group I: Orderbook at open (dynamic — OB changes over time)
     feats.update(compute_orderbook_at_open(day, T_ms, open_ref))
 
-    # Group J: VPIN
+    # Group J: VPIN (dynamic)
     feats.update(compute_vpin(day, T_ms))
 
-    # Group K: Cross-exchange
+    # Group K: Cross-exchange (dynamic)
     feats.update(compute_cross_exchange(day, T_ms, open_ref=open_ref))
 
-    # Group L: Pre-block (static — computed from data before block_start_ms)
-    feats.update(compute_preblock(day, block_start_ms))
+    # Group L: Pre-block (STATIC per block — cache)
+    if block_cache is not None and 'preblock' in block_cache:
+        feats.update(block_cache['preblock'])
+    else:
+        pb = compute_preblock(day, block_start_ms)
+        feats.update(pb)
+        if block_cache is not None:
+            block_cache['preblock'] = pb
 
     return feats

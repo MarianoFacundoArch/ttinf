@@ -282,6 +282,7 @@ def process_day(date_str, data_dir=None, output_dir=None):
 
         # Generate rows every 5s within block
         n_blocks_ok += 1
+        block_cache = {}  # Cache static features within this block
         for sample_offset_ms in range(0, BLOCK_DURATION_MS, SAMPLE_INTERVAL_MS):
             T_ms = block_start_ms + sample_offset_ms
 
@@ -295,6 +296,7 @@ def process_day(date_str, data_dir=None, output_dir=None):
                 day, ref, T_ms, block_start_ms, open_ref,
                 open_ref_age_ms=open_ref_age_ms,
                 block_results=block_results_history,
+                block_cache=block_cache,
             )
 
             # Store row

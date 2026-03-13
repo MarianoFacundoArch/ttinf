@@ -37,6 +37,10 @@ SPOT_REST = "https://api.binance.com"
 
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
+# Cross-exchange websockets
+COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
+BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
+
 # Accuracy and ECE per 5-second bucket (from walk-forward 8 folds)
 # Key: (lo, hi) in seconds_to_expiry → (accuracy, ece)
 BUCKET_STATS = {}
@@ -74,6 +78,48 @@ def get_bucket_stats(seconds_to_expiry):
     lo = int(s // 5) * 5
     hi = lo + 5
     return BUCKET_STATS.get((lo, hi), (0.50, 0.02))
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Health Tracking
+# ---------------------------------------------------------------------------
+
+class WSHealth:
+    """Track last message time for each websocket connection."""
+
+    def __init__(self):
+        self.last_msg = {
+            "binance_futures": 0.0,
+            "binance_spot": 0.0,
+            "coinbase": 0.0,
+            "bybit": 0.0,
+        }
+
+    def update(self, source):
+        self.last_msg[source] = time.time()
+
+    def age(self, source):
+        t = self.last_msg[source]
+        return time.time() - t if t > 0 else float('inf')
+
+    def is_fresh(self, source, max_age_s=5.0):
+        return self.age(source) < max_age_s
+
+    def binance_ok(self):
+        """Binance futures must be fresh to predict."""
+        return self.is_fresh("binance_futures", 5.0)
+
+    def status_line(self):
+        parts = []
+        for src in ["binance_futures", "binance_spot", "coinbase", "bybit"]:
+            age = self.age(src)
+            if age == float('inf'):
+                parts.append(f"{src}:OFF")
+            elif age > 10:
+                parts.append(f"{src}:STALE({age:.0f}s)")
+            else:
+                parts.append(f"{src}:OK")
+        return " | ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +317,7 @@ async def warmup(buffer, session):
 # WebSocket handlers
 # ---------------------------------------------------------------------------
 
-async def ws_futures_stream(buffer, stop_event):
+async def ws_futures_stream(buffer, health, stop_event):
     """Connect to futures combined stream."""
     streams = [
         f"{SYMBOL}@aggTrade",
@@ -291,6 +337,7 @@ async def ws_futures_stream(buffer, stop_event):
                 async for msg in ws:
                     if stop_event.is_set():
                         break
+                    health.update("binance_futures")
                     try:
                         data = json.loads(msg)
                         stream = data.get("stream", "")
@@ -338,7 +385,7 @@ async def ws_futures_stream(buffer, stop_event):
                 await asyncio.sleep(2)
 
 
-async def ws_spot_stream(buffer, stop_event):
+async def ws_spot_stream(buffer, health, stop_event):
     """Connect to spot combined stream."""
     streams = [
         f"{SYMBOL}@aggTrade",
@@ -355,6 +402,7 @@ async def ws_spot_stream(buffer, stop_event):
                 async for msg in ws:
                     if stop_event.is_set():
                         break
+                    health.update("binance_spot")
                     try:
                         data = json.loads(msg)
                         stream = data.get("stream", "")
@@ -386,6 +434,138 @@ async def ws_spot_stream(buffer, stop_event):
             if not stop_event.is_set():
                 print(f"\n[spot ws] reconnecting: {e}")
                 await asyncio.sleep(2)
+
+
+async def ws_coinbase_stream(buffer, health, stop_event):
+    """Connect to Coinbase websocket for BTC-USD quotes, trades, and L2 book."""
+    sub_msg = json.dumps({
+        "type": "subscribe",
+        "product_ids": ["BTC-USD"],
+        "channels": ["ticker", "matches", "level2"],
+    })
+
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(COINBASE_WS, ssl=SSL_CONTEXT,
+                                          ping_interval=30,
+                                          ping_timeout=20,
+                                          max_size=2**22) as ws:
+                await ws.send(sub_msg)
+                async for msg in ws:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        d = json.loads(msg)
+                        msg_type = d.get("type", "")
+
+                        if msg_type == "ticker":
+                            ts = int(time.time() * 1000)
+                            bid = float(d["best_bid"])
+                            ask = float(d["best_ask"])
+                            buffer.add_coinbase_quote(ts, bid, ask)
+                            # Also record as trade from ticker price/size
+                            price = float(d.get("price", 0))
+                            size = float(d.get("last_size", 0))
+                            if price > 0 and size > 0:
+                                ibm = d.get("side", "buy") == "sell"
+                                buffer.add_coinbase_trade(ts, price, size, ibm)
+                            health.update("coinbase")
+
+                        elif msg_type in ("match", "last_match"):
+                            ts = int(time.time() * 1000)
+                            price = float(d["price"])
+                            qty = float(d["size"])
+                            # side = taker side: "sell" → buyer was maker
+                            ibm = d.get("side", "buy") == "sell"
+                            buffer.add_coinbase_trade(ts, price, qty, ibm)
+                            health.update("coinbase")
+
+                        elif msg_type == "snapshot":
+                            # L2 book snapshot (initial)
+                            ts = int(time.time() * 1000)
+                            bids = d.get("bids", [])
+                            asks = d.get("asks", [])
+                            buffer.update_coinbase_book(True, bids, asks, ts)
+                            health.update("coinbase")
+
+                        elif msg_type == "l2update":
+                            # L2 incremental update
+                            ts = int(time.time() * 1000)
+                            changes = d.get("changes", [])
+                            bids = [(c[1], c[2]) for c in changes if c[0] == "buy"]
+                            asks = [(c[1], c[2]) for c in changes if c[0] == "sell"]
+                            buffer.update_coinbase_book(False, bids, asks, ts)
+                            health.update("coinbase")
+
+                    except (KeyError, ValueError):
+                        pass
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"\n[coinbase ws] reconnecting: {e}")
+                await asyncio.sleep(5)
+
+
+async def ws_bybit_stream(buffer, health, stop_event):
+    """Connect to Bybit websocket for BTCUSDT quotes, trades, and orderbook."""
+    sub_msg = json.dumps({
+        "op": "subscribe",
+        "args": ["tickers.BTCUSDT", "publicTrade.BTCUSDT", "orderbook.25.BTCUSDT"],
+    })
+
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(BYBIT_WS, ssl=SSL_CONTEXT,
+                                          ping_interval=20,
+                                          ping_timeout=10,
+                                          max_size=2**22) as ws:
+                await ws.send(sub_msg)
+                last_ping = time.time()
+                async for msg in ws:
+                    if stop_event.is_set():
+                        break
+                    # Bybit app-level ping every 20s
+                    if time.time() - last_ping > 20:
+                        await ws.send('{"op":"ping"}')
+                        last_ping = time.time()
+                    try:
+                        d = json.loads(msg)
+                        topic = d.get("topic", "")
+
+                        if topic.startswith("tickers."):
+                            data = d.get("data", {})
+                            ts = int(d.get("ts", time.time() * 1000))
+                            bid = float(data.get("bid1Price", 0))
+                            ask = float(data.get("ask1Price", 0))
+                            if bid > 0 and ask > 0:
+                                buffer.add_bybit_quote(ts, bid, ask)
+                                health.update("bybit")
+
+                        elif topic.startswith("publicTrade."):
+                            for t in d.get("data", []):
+                                ts = int(t.get("T", time.time() * 1000))
+                                price = float(t["p"])
+                                qty = float(t["v"])
+                                # S="Sell" → seller was taker → buyer was maker
+                                ibm = t.get("S", "Buy") == "Sell"
+                                buffer.add_bybit_trade(ts, price, qty, ibm)
+                                health.update("bybit")
+
+                        elif topic.startswith("orderbook."):
+                            # Bybit L2: snapshot or delta
+                            data = d.get("data", {})
+                            is_snap = d.get("type") == "snapshot"
+                            bids = data.get("b", [])
+                            asks = data.get("a", [])
+                            ts = int(d.get("ts", time.time() * 1000))
+                            buffer.update_bybit_book(is_snap, bids, asks, ts)
+                            health.update("bybit")
+
+                    except (KeyError, ValueError):
+                        pass
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"\n[bybit ws] reconnecting: {e}")
+                await asyncio.sleep(5)
 
 
 async def metrics_poller(buffer, session, stop_event):
@@ -434,16 +614,30 @@ async def metrics_poller(buffer, session, stop_event):
 # ---------------------------------------------------------------------------
 
 async def prediction_loop(buffer, predictor, interval, stop_event,
-                          ws_clients=None):
+                          health=None, ws_clients=None):
     """Run prediction every `interval` seconds."""
     await asyncio.sleep(3)
 
     last_block = 0
     block_count = 0
+    last_health_log = 0
 
     while not stop_event.is_set():
         try:
             now_ms = int(time.time() * 1000)
+
+            # Health check: don't predict if Binance futures is down
+            if health and not health.binance_ok():
+                age = health.age("binance_futures")
+                print(f"\r  BINANCE DOWN ({age:.0f}s) — skipping prediction | "
+                      f"{health.status_line()}  ", end="", flush=True)
+                await asyncio.sleep(interval)
+                continue
+
+            # Periodic health log (every 60s)
+            if health and time.time() - last_health_log > 60:
+                print(f"\n  [health] {health.status_line()}")
+                last_health_log = time.time()
 
             # Trim old data
             buffer.trim(now_ms)
@@ -571,6 +765,7 @@ async def ws_server_handler(websocket, ws_clients):
 async def main(interval=1, ws_port=8765):
     buffer = LiveBuffer(max_seconds=600)
     predictor = LivePredictor()
+    health = WSHealth()
 
     # Websocket clients set (shared with prediction_loop)
     ws_clients = set()
@@ -582,6 +777,7 @@ async def main(interval=1, ws_port=8765):
     print(f"  Features: {len(predictor.feature_cols)}")
     print(f"  Interval: {interval}s")
     print(f"  WS server: ws://localhost:{ws_port}")
+    print(f"  Feeds: Binance(futures+spot) + Coinbase + Bybit")
     print()
 
     async with aiohttp.ClientSession() as session:
@@ -598,11 +794,13 @@ async def main(interval=1, ws_port=8765):
 
         try:
             await asyncio.gather(
-                ws_futures_stream(buffer, stop_event),
-                ws_spot_stream(buffer, stop_event),
+                ws_futures_stream(buffer, health, stop_event),
+                ws_spot_stream(buffer, health, stop_event),
+                ws_coinbase_stream(buffer, health, stop_event),
+                ws_bybit_stream(buffer, health, stop_event),
                 metrics_poller(buffer, session, stop_event),
                 prediction_loop(buffer, predictor, interval, stop_event,
-                                ws_clients),
+                                health, ws_clients),
             )
         except KeyboardInterrupt:
             print("\n\nStopping...")

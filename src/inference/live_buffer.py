@@ -10,6 +10,65 @@ import time
 from src.features.feature_engine_v3 import DayData, _precompute_book
 
 
+class LocalBook:
+    """Maintains a local L2 orderbook from incremental WS updates."""
+
+    def __init__(self, max_levels=20):
+        self.max_levels = max_levels
+        self.bids = {}  # price -> qty
+        self.asks = {}  # price -> qty
+
+    def apply_snapshot(self, bids, asks):
+        """Replace entire book with snapshot data."""
+        self.bids = {}
+        for price, qty in bids:
+            p, q = float(price), float(qty)
+            if q > 0:
+                self.bids[p] = q
+        self.asks = {}
+        for price, qty in asks:
+            p, q = float(price), float(qty)
+            if q > 0:
+                self.asks[p] = q
+
+    def apply_delta(self, bids, asks):
+        """Apply incremental updates to book."""
+        for price, qty in bids:
+            p, q = float(price), float(qty)
+            if q == 0:
+                self.bids.pop(p, None)
+            else:
+                self.bids[p] = q
+        for price, qty in asks:
+            p, q = float(price), float(qty)
+            if q == 0:
+                self.asks.pop(p, None)
+            else:
+                self.asks[p] = q
+
+    def top_levels(self):
+        """Return top N bid/ask levels as padded lists of length max_levels."""
+        n = self.max_levels
+        sorted_bids = sorted(self.bids.items(), key=lambda x: -x[0])[:n]
+        sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:n]
+
+        bp = [p for p, q in sorted_bids]
+        bq = [q for p, q in sorted_bids]
+        ap = [p for p, q in sorted_asks]
+        aq = [q for p, q in sorted_asks]
+
+        while len(bp) < n:
+            bp.append(0.0); bq.append(0.0)
+        while len(ap) < n:
+            ap.append(0.0); aq.append(0.0)
+
+        return bp, bq, ap, aq
+
+    def is_valid(self):
+        """Check if book has at least 1 bid and 1 ask."""
+        return len(self.bids) > 0 and len(self.asks) > 0
+
+
 class LiveBuffer:
     """Accumulates live market data into arrays for feature computation."""
 
@@ -93,6 +152,22 @@ class LiveBuffer:
         self.bt_qty = []
         self.bt_ibm = []
 
+        # --- Cross-exchange: Coinbase L2 orderbook ---
+        self.book_cb = LocalBook()
+        self.ob_cb_ts = []
+        self.ob_cb_bid_prices = []
+        self.ob_cb_bid_qtys = []
+        self.ob_cb_ask_prices = []
+        self.ob_cb_ask_qtys = []
+
+        # --- Cross-exchange: Bybit orderbook ---
+        self.book_bb = LocalBook()
+        self.ob_bb_ts = []
+        self.ob_bb_bid_prices = []
+        self.ob_bb_bid_qtys = []
+        self.ob_bb_ask_prices = []
+        self.ob_bb_ask_qtys = []
+
     # --- Add methods for each stream ---
 
     def add_trade_futures(self, timestamp_ms, price, qty, is_buyer_maker):
@@ -174,6 +249,41 @@ class LiveBuffer:
         self.bt_qty.append(qty)
         self.bt_ibm.append(is_buyer_maker)
 
+    def update_coinbase_book(self, is_snapshot, bids, asks, timestamp_ms):
+        """Update Coinbase local book and store snapshot (throttled to ~200ms)."""
+        if is_snapshot:
+            self.book_cb.apply_snapshot(bids, asks)
+        else:
+            self.book_cb.apply_delta(bids, asks)
+        # Throttle: only store snapshot every 200ms
+        if self.ob_cb_ts and timestamp_ms - self.ob_cb_ts[-1] < 200:
+            return
+        if not self.book_cb.is_valid():
+            return
+        bp, bq, ap, aq = self.book_cb.top_levels()
+        self.ob_cb_ts.append(timestamp_ms)
+        self.ob_cb_bid_prices.append(bp)
+        self.ob_cb_bid_qtys.append(bq)
+        self.ob_cb_ask_prices.append(ap)
+        self.ob_cb_ask_qtys.append(aq)
+
+    def update_bybit_book(self, is_snapshot, bids, asks, timestamp_ms):
+        """Update Bybit local book and store snapshot (throttled to ~200ms)."""
+        if is_snapshot:
+            self.book_bb.apply_snapshot(bids, asks)
+        else:
+            self.book_bb.apply_delta(bids, asks)
+        if self.ob_bb_ts and timestamp_ms - self.ob_bb_ts[-1] < 200:
+            return
+        if not self.book_bb.is_valid():
+            return
+        bp, bq, ap, aq = self.book_bb.top_levels()
+        self.ob_bb_ts.append(timestamp_ms)
+        self.ob_bb_bid_prices.append(bp)
+        self.ob_bb_bid_qtys.append(bq)
+        self.ob_bb_ask_prices.append(ap)
+        self.ob_bb_ask_qtys.append(aq)
+
     # --- Trim old data ---
 
     def trim(self, now_ms=None):
@@ -215,6 +325,10 @@ class LiveBuffer:
         _trim_list(self.bb_ts, self.bb_bid, self.bb_ask)
         _trim_list(self.ct_ts, self.ct_price, self.ct_qty, self.ct_ibm)
         _trim_list(self.bt_ts, self.bt_price, self.bt_qty, self.bt_ibm)
+        _trim_list(self.ob_cb_ts, self.ob_cb_bid_prices, self.ob_cb_bid_qtys,
+                   self.ob_cb_ask_prices, self.ob_cb_ask_qtys)
+        _trim_list(self.ob_bb_ts, self.ob_bb_bid_prices, self.ob_bb_bid_qtys,
+                   self.ob_bb_ask_prices, self.ob_bb_ask_qtys)
 
     # --- Convert to DayData ---
 
@@ -336,6 +450,38 @@ class LiveBuffer:
         day.bt_qty   = np.array(self.bt_qty[:n], dtype=np.float64)
         day.bt_ibm   = np.array(self.bt_ibm[:n], dtype=bool)
 
+        # Coinbase orderbook
+        n = len(self.ob_cb_ts)
+        if n > 0:
+            ts = np.array(self.ob_cb_ts[:n], dtype=np.int64)
+            bp = np.array(self.ob_cb_bid_prices[:n])
+            bq = np.array(self.ob_cb_bid_qtys[:n])
+            ap = np.array(self.ob_cb_ask_prices[:n])
+            aq = np.array(self.ob_cb_ask_qtys[:n])
+            day.ob_cb = _precompute_book(ts, bp, bq, ap, aq)
+        else:
+            day.ob_cb = {'ts': np.array([], dtype=np.int64),
+                         'mid': np.array([]), 'spread_bps': np.array([]),
+                         'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                         'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                         'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
+
+        # Bybit orderbook
+        n = len(self.ob_bb_ts)
+        if n > 0:
+            ts = np.array(self.ob_bb_ts[:n], dtype=np.int64)
+            bp = np.array(self.ob_bb_bid_prices[:n])
+            bq = np.array(self.ob_bb_bid_qtys[:n])
+            ap = np.array(self.ob_bb_ask_prices[:n])
+            aq = np.array(self.ob_bb_ask_qtys[:n])
+            day.ob_bb = _precompute_book(ts, bp, bq, ap, aq)
+        else:
+            day.ob_bb = {'ts': np.array([], dtype=np.int64),
+                         'mid': np.array([]), 'spread_bps': np.array([]),
+                         'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                         'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                         'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
+
         return day
 
     def stats(self):
@@ -354,4 +500,6 @@ class LiveBuffer:
             "bybit_quotes": len(self.bb_ts),
             "coinbase_trades": len(self.ct_ts),
             "bybit_trades": len(self.bt_ts),
+            "coinbase_depth": len(self.ob_cb_ts),
+            "bybit_depth": len(self.ob_bb_ts),
         }
