@@ -132,6 +132,34 @@ def _merge_day_data(main_day, extra_day, prepend=True):
     main_day.mt_taker_ls = np.concatenate([first.mt_taker_ls, second.mt_taker_ls])
     main_day.mt_oi       = np.concatenate([first.mt_oi, second.mt_oi])
 
+    # Cross-exchange: Coinbase quotes
+    if hasattr(first, 'cb_ts') and hasattr(second, 'cb_ts'):
+        main_day.cb_ts  = np.concatenate([first.cb_ts, second.cb_ts])
+        main_day.cb_bid = np.concatenate([first.cb_bid, second.cb_bid])
+        main_day.cb_ask = np.concatenate([first.cb_ask, second.cb_ask])
+        main_day.cb_mid = np.concatenate([first.cb_mid, second.cb_mid])
+
+    # Cross-exchange: Bybit quotes
+    if hasattr(first, 'bb_ts') and hasattr(second, 'bb_ts'):
+        main_day.bb_ts  = np.concatenate([first.bb_ts, second.bb_ts])
+        main_day.bb_bid = np.concatenate([first.bb_bid, second.bb_bid])
+        main_day.bb_ask = np.concatenate([first.bb_ask, second.bb_ask])
+        main_day.bb_mid = np.concatenate([first.bb_mid, second.bb_mid])
+
+    # Cross-exchange: Coinbase trades
+    if hasattr(first, 'ct_ts') and hasattr(second, 'ct_ts'):
+        main_day.ct_ts    = np.concatenate([first.ct_ts, second.ct_ts])
+        main_day.ct_price = np.concatenate([first.ct_price, second.ct_price])
+        main_day.ct_qty   = np.concatenate([first.ct_qty, second.ct_qty])
+        main_day.ct_ibm   = np.concatenate([first.ct_ibm, second.ct_ibm])
+
+    # Cross-exchange: Bybit trades
+    if hasattr(first, 'bt_ts') and hasattr(second, 'bt_ts'):
+        main_day.bt_ts    = np.concatenate([first.bt_ts, second.bt_ts])
+        main_day.bt_price = np.concatenate([first.bt_price, second.bt_price])
+        main_day.bt_qty   = np.concatenate([first.bt_qty, second.bt_qty])
+        main_day.bt_ibm   = np.concatenate([first.bt_ibm, second.bt_ibm])
+
     return main_day
 
 

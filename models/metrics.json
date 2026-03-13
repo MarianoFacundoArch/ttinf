@@ -1,0 +1,5 @@
+{
+  "mode": "temporal_split",
+  "train_frac": 0.8,
+  "best_iteration": 52
+}

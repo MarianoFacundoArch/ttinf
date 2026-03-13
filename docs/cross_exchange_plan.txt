@@ -1,71 +1,205 @@
 PLAN: Cross-Exchange Data (Coinbase + Bybit)
 =============================================
+Fecha: 2026-03-12
 
-ESTADO ACTUAL: Paso 1 en progreso (descargando datos)
+================================================================================
+CONTEXTO: POR QUE AGREGAR DATOS DE OTROS EXCHANGES
+================================================================================
 
-PASO 1: Descargar datos historicos de Coinbase + Bybit [EN PROGRESO]
-  - Comando: python -m src.data.download_all --start 2025-11-11 --end 2026-03-11 --cross-only --workers 4
-  - 6 streams: cb_quotes, cb_trades, cb_book_l2, bb_quotes, bb_trades, bb_book25
-  - Se guarda en data/raw/YYYY-MM-DD/coinbase_*/ y bybit_*/
+El modelo predice P(Up) para bloques de 5 minutos de BTC en Polymarket.
+Actualmente usa solo datos de Binance (spot + futures).
+
+Hallazgos clave del analisis actual (108 features, LR=0.01, 8 folds):
+  - El modelo tiene edge REAL en los ultimos 60s del bloque (estadisticamente significativo)
+  - En 0-30s: 62.9% directional accuracy vs Brownian, p=0.0065, 8/8 folds
+  - En 30-60s: 56.9%, p=0.038, 5/8 folds
+  - El edge esta en casos DUDOSOS (P=0.40-0.60): +0.0140 vs Brownian
+  - Features de microestructura (spread, imbalance, order flow) son las que aportan
+
+Hipotesis: datos de otros exchanges agregan informacion NUEVA porque:
+  - Coinbase = mercado institucional US, participantes distintos a Binance
+  - Bybit = mercado derivados asiatico, otro pool de traders
+  - Si Coinbase y Bybit muestran presion compradora que Binance no ve aun,
+    eso es senal predictiva genuina
+  - Cross-exchange price divergence = presion de arbitraje no resuelta
+
+================================================================================
+BASELINE ANTES DE CAMBIOS (para comparar luego)
+================================================================================
+
+Metricas walk-forward (8 folds, LR=0.01, 108 features):
+  accuracy:            0.7624
+  logloss:             0.4630
+  brier:               0.1546
+  auc:                 0.8566
+  delta_vs_bm_acc:     +0.0025
+  consistency:         8/8 folds LightGBM > Brownian
+  best_iteration:      451
+
+Confidence edge:
+  low (0.45-0.55):     +0.0034 vs Brownian
+  med (0.40-0.60):     +0.0140
+  high (0.35-0.65):    +0.0061
+
+Directional edge (model vs Brownian cuando no estan de acuerdo):
+  0-30s:   62.9%, p=0.0065, 8/8 folds significativo
+  30-60s:  56.9%, p=0.038, 5/8 folds
+  60-120s: 53.4%, p=0.10, 6/8 folds
+  120+s:   ~50%, no significativo
+
+Calibracion: Brier del modelo MEJOR que Brownian en todos los time buckets.
+Calibracion predicted vs actual: casi todo OK (<3% error), excepto bins con N chico.
+
+Top 5 features actuales:
+  1. dist_to_open_bps (6.0%)
+  2. seconds_to_expiry (5.9%)
+  3. brownian_prob (5.0%)
+  4. vol_ratio (4.7%)
+  5. mean_return_last_6 (4.5%)
+
+================================================================================
+FEATURES A AGREGAR POR RONDA
+================================================================================
+
+--- RONDA 1: Solo quotes (best bid/ask) - 6 features ---
+Datos necesarios: coinbase_quotes, bybit_quotes (ya descargando)
+
+  cb_spread_bps
+    Que es: (ask - bid) / mid * 10000 en Coinbase
+    Por que sirve: spread alto = menos liquidez en ese venue,
+    incertidumbre. Si Coinbase tiene spread alto pero Binance bajo,
+    puede indicar que el mercado institucional US esta indeciso.
+    Similar a: spot_spread_bps (2.2% importance) pero de otro venue.
+
+  bb_spread_bps
+    Que es: spread de Bybit
+    Por que sirve: igual que arriba pero del mercado asiatico.
+
+  cb_vs_binance_bps
+    Que es: (mid_coinbase - mid_binance) / mid_binance * 10000
+    Por que sirve: si Coinbase esta mas caro que Binance, hay presion
+    compradora que no se ha arbitrado. Senal predictiva directa.
+    NUEVA: no existe equivalente en features actuales.
+
+  bb_vs_binance_bps
+    Que es: (mid_bybit - mid_binance) / mid_binance * 10000
+    Por que sirve: igual que arriba desde el mercado asiatico.
+
+  cross_mean_vs_binance
+    Que es: promedio de cb_vs_binance y bb_vs_binance
+    Por que sirve: consenso. Si AMBOS exchanges estan mas caros que
+    Binance, la presion compradora es mas fuerte y confiable.
+
+  cross_price_std_bps
+    Que es: desviacion estandar de los mid prices de los 3 exchanges
+    Por que sirve: alta dispersion = incertidumbre entre mercados,
+    baja dispersion = consenso. Informacion de regimen nueva.
+
+--- RONDA 2: + Trades - 4 features ---
+Datos necesarios: coinbase_trades, bybit_trades (ya descargando)
+
+  cb_buy_pct_30s
+    Que es: % de volumen comprador en Coinbase en ultimos 30s
+    Por que sirve: si institucionales en Coinbase estan comprando
+    agresivamente, puede liderar el movimiento en Binance.
+    Similar a: spot_buy_pct_30s pero de participantes distintos.
+
+  bb_buy_pct_30s
+    Que es: % de volumen comprador en Bybit
+    Por que sirve: igual desde mercado asiatico.
+
+  cb_leads_binance_5s
+    Que es: cambio de precio en Coinbase hace 5s vs cambio actual en Binance
+    Por que sirve: detecta si Coinbase se mueve ANTES que Binance.
+    Si Coinbase sube y Binance no todavia, predice que Binance subira.
+    NUEVA: senal de lead-lag, no existe en features actuales.
+
+  volume_share_binance
+    Que es: volumen_binance / (volumen_binance + volumen_coinbase + volumen_bybit)
+    Por que sirve: si el volumen se concentra en un exchange,
+    ese exchange esta liderando el price discovery.
+
+--- RONDA 3: + Depth (orderbook) - 4+ features ---
+Datos necesarios: coinbase_book_l2, bybit_orderbook (ya descargando)
+
+  cb_imbalance_L5
+    Que es: (bid_vol - ask_vol) / (bid_vol + ask_vol) top 5 niveles Coinbase
+    Por que sirve: imbalance en otro venue = presion diferente.
+    Similar a: spot_imbalance_L5 (2.0%) pero de otro pool de liquidez.
+
+  bb_imbalance_L5
+    Que es: imbalance top 5 niveles Bybit
+    Por que sirve: igual desde mercado asiatico.
+
+  cb_ob_near_open
+    Que es: volumen en libro de Coinbase cerca del open price (traducido al
+    espacio de precios de Coinbase usando el spread cross-exchange)
+    Por que sirve: si hay un wall enorme en Coinbase cerca del open,
+    es resistencia/soporte real desde otro venue.
+    Similar a: ob_bid_vol_near_open (1.7%) pero cross-exchange.
+    Traduccion: cb_open_equiv = open_ref + (cb_mid - binance_mid)
+
+  bb_ob_near_open
+    Que es: igual pero de Bybit
+    Por que sirve: walls en Bybit = resistencia desde otro mercado.
+
+================================================================================
+PASOS DE IMPLEMENTACION
+================================================================================
+
+PASO 1: Descargar datos [EN PROGRESO]
+  Comando: python -m src.data.download_all --start 2025-11-11 --end 2026-03-11 --cross-only --workers 4
+  6 streams x ~120 dias. Skipea lo ya descargado.
 
 PASO 2: Actualizar feature_engine_v3.py
-  - Agregar campos cross-exchange a DayData (cb_ts, cb_bid, cb_ask, cb_trades, bb_*)
+  - Agregar campos cross-exchange a DayData
   - Actualizar load_day_data() para cargar los nuevos parquets
-  - Crear compute_cross_exchange_features()
-  - Ronda 1 (6 features, solo quotes):
-      cb_spread_bps           - spread de Coinbase
-      bb_spread_bps           - spread de Bybit
-      cb_vs_binance_bps       - Coinbase precio vs Binance
-      bb_vs_binance_bps       - Bybit precio vs Binance
-      cross_mean_vs_binance   - promedio de todos vs Binance
-      cross_price_std_bps     - desviacion entre exchanges
-  - Ronda 2 (4 features, + trades):
-      cb_buy_pct_30s          - flujo comprador Coinbase
-      bb_buy_pct_30s          - flujo comprador Bybit
-      cb_leads_binance_5s     - lead-lag Coinbase vs Binance
-      volume_share_binance    - % volumen en Binance vs total
-  - Ronda 3 (4+ features, + depth):
-      cb_imbalance_L5         - imbalance libro Coinbase
-      bb_imbalance_L5         - imbalance libro Bybit
-      cb_ob_near_open         - volume near open en Coinbase (traducido)
-      bb_ob_near_open         - volume near open en Bybit (traducido)
+  - Crear compute_cross_exchange_features() - empezar con Ronda 1
 
 PASO 3: Actualizar build_dataset_v3.py
   - Merge de datos cross-exchange en _merge_day_data()
-  - Las features nuevas se calculan automaticamente
 
 PASO 4: Reconstruir dataset
-  - python -m src.training.build_dataset_v3 --start 2025-11-11 --end 2026-03-11 --workers 8
+  python -m src.training.build_dataset_v3 --start 2025-11-11 --end 2026-03-11 --workers 8
 
-PASO 5: Entrenar walk-forward y comparar
-  - python -m src.training.train_model_v3 --walkforward
+PASO 5: Entrenar walk-forward
+  python -m src.training.train_model_v3 --walkforward
 
-PASO 6: Evaluar resultados - comparar con baseline (LR=0.01):
-  - accuracy: 0.7624
-  - delta_vs_bm_acc: +0.0025
-  - confidence low (0.45-0.55): +0.0034
-  - 0-30s directional: 62.9%, 8/8 folds
-  - best_iteration: 451
+PASO 6: Evaluar resultados vs baseline de arriba
   Preguntas clave:
-  - Mejoro accuracy? delta_vs_bm_acc?
-  - Mejoro en casos dudosos (confianza 0.45-0.55)?
-  - Mejoro en ultimos 60s?
+  - Mejoro accuracy? (baseline: 0.7624)
+  - Mejoro delta_vs_bm_acc? (baseline: +0.0025)
+  - Mejoro en casos dudosos? (baseline: +0.0034 low, +0.0140 med)
+  - Mejoro en ultimos 60s? (baseline: 62.9% en 0-30s)
   - Las features nuevas entraron al top 30?
+  - Calibracion sigue OK?
 
-PASO 7: Si Ronda 1 suma -> Ronda 2 (trades) -> Ronda 3 (depth)
-  - Cada ronda: agregar features, rebuild dataset, train, comparar
+PASO 7: Iterar rondas
+  Si Ronda 1 suma -> agregar Ronda 2 features -> rebuild -> train -> comparar
+  Si Ronda 2 suma -> agregar Ronda 3 features -> rebuild -> train -> comparar
+  Si una ronda NO suma -> quitar esas features y seguir con la siguiente
 
 PASO 8: Actualizar live inference
   - Agregar websockets de Coinbase y Bybit a live_runner.py
-  - Coinbase: canal "ticker" (quotes) + "matches" (trades) - gratis
-  - Bybit: canal "tickers" (quotes) + "publicTrade" (trades) - gratis
+  - Coinbase: canal "ticker" (quotes gratis) + "matches" (trades gratis)
+  - Bybit: canal "tickers" (quotes gratis) + "publicTrade" (trades gratis)
   - Actualizar live_buffer.py con campos cross-exchange
-  - Actualizar live_predictor.py (ya lee features del modelo)
+  - live_predictor.py ya lee features del modelo, no necesita cambio
 
-HYPERPARAMETROS ACTUALES:
-  - learning_rate: 0.01
-  - early_stopping: 500
-  - num_boost_round: 3000
-  - Pendiente: probar LR=0.005 despues de agregar datos
+================================================================================
+HYPERPARAMETROS ACTUALES
+================================================================================
+  learning_rate: 0.01 (mejorado desde 0.03)
+  early_stopping: 500
+  num_boost_round: 3000
+  Pendiente: probar LR=0.005 DESPUES de agregar todos los datos
+  Al agregar features nuevas, re-tunear hyperparametros
 
-NOTA: al agregar todos los datos, tunear hyperparametros de nuevo
+================================================================================
+EXCHANGES
+================================================================================
+  Coinbase: exchange ID en Tardis = "coinbase", simbolo = "BTC-USD"
+            Mercado institucional US. Quotes + trades + incremental L2.
+  Bybit:    exchange ID en Tardis = "bybit-spot", simbolo = "BTCUSDT"
+            Mercado derivados asiatico. Quotes + trades + book_snapshot_25.
+  Websockets live: ambos gratis, sin API key para datos publicos.

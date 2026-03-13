@@ -206,6 +206,66 @@ def load_day_data(date_str, data_dir=None):
         day.mt_taker_ls = np.array([], dtype=np.float64)
         day.mt_oi       = np.array([], dtype=np.float64)
 
+    # --- Cross-exchange: Coinbase quotes ---
+    path = d / "coinbase_quotes" / "full_day.parquet"
+    if path.exists():
+        df = pq.read_table(path).to_pandas()
+        day.cb_ts  = df["timestamp_ms"].values.astype(np.int64)
+        day.cb_bid = df["best_bid_price"].values.astype(np.float64)
+        day.cb_ask = df["best_ask_price"].values.astype(np.float64)
+        day.cb_mid = (day.cb_bid + day.cb_ask) / 2.0
+        del df
+    else:
+        day.cb_ts  = np.array([], dtype=np.int64)
+        day.cb_bid = np.array([], dtype=np.float64)
+        day.cb_ask = np.array([], dtype=np.float64)
+        day.cb_mid = np.array([], dtype=np.float64)
+
+    # --- Cross-exchange: Bybit quotes ---
+    path = d / "bybit_quotes" / "full_day.parquet"
+    if path.exists():
+        df = pq.read_table(path).to_pandas()
+        day.bb_ts  = df["timestamp_ms"].values.astype(np.int64)
+        day.bb_bid = df["best_bid_price"].values.astype(np.float64)
+        day.bb_ask = df["best_ask_price"].values.astype(np.float64)
+        day.bb_mid = (day.bb_bid + day.bb_ask) / 2.0
+        del df
+    else:
+        day.bb_ts  = np.array([], dtype=np.int64)
+        day.bb_bid = np.array([], dtype=np.float64)
+        day.bb_ask = np.array([], dtype=np.float64)
+        day.bb_mid = np.array([], dtype=np.float64)
+
+    # --- Cross-exchange: Coinbase trades ---
+    path = d / "coinbase_trades" / "full_day.parquet"
+    if path.exists():
+        df = pq.read_table(path).to_pandas()
+        day.ct_ts    = df["timestamp_ms"].values.astype(np.int64)
+        day.ct_price = df["price"].values.astype(np.float64)
+        day.ct_qty   = df["qty"].values.astype(np.float64)
+        day.ct_ibm   = df["is_buyer_maker"].values
+        del df
+    else:
+        day.ct_ts    = np.array([], dtype=np.int64)
+        day.ct_price = np.array([], dtype=np.float64)
+        day.ct_qty   = np.array([], dtype=np.float64)
+        day.ct_ibm   = np.array([], dtype=bool)
+
+    # --- Cross-exchange: Bybit trades ---
+    path = d / "bybit_trades" / "full_day.parquet"
+    if path.exists():
+        df = pq.read_table(path).to_pandas()
+        day.bt_ts    = df["timestamp_ms"].values.astype(np.int64)
+        day.bt_price = df["price"].values.astype(np.float64)
+        day.bt_qty   = df["qty"].values.astype(np.float64)
+        day.bt_ibm   = df["is_buyer_maker"].values
+        del df
+    else:
+        day.bt_ts    = np.array([], dtype=np.int64)
+        day.bt_price = np.array([], dtype=np.float64)
+        day.bt_qty   = np.array([], dtype=np.float64)
+        day.bt_ibm   = np.array([], dtype=bool)
+
     return day
 
 
@@ -1092,6 +1152,189 @@ def compute_orderbook_at_open(day, T_ms, open_ref):
 
 
 # ---------------------------------------------------------------------------
+# GROUP K: Cross-exchange features (Ronda 1: 6 quotes + Ronda 2: 4 trades)
+# ---------------------------------------------------------------------------
+
+def _has_cross_exchange(day):
+    """Check if DayData has cross-exchange fields loaded."""
+    return hasattr(day, 'cb_ts') and hasattr(day, 'bb_ts')
+
+
+def compute_cross_exchange(day, T_ms):
+    """Cross-exchange features from Coinbase and Bybit quotes + trades.
+
+    Ronda 1 (quotes - 6 features):
+      cb_spread_bps      - Coinbase bid-ask spread
+      bb_spread_bps      - Bybit bid-ask spread
+      cb_vs_binance_bps  - Coinbase mid vs Binance spot mid
+      bb_vs_binance_bps  - Bybit mid vs Binance spot mid
+      cross_mean_vs_binance - average of cb and bb vs binance
+      cross_price_std_bps   - std dev of mids across 3 exchanges
+
+    Ronda 2 (trades - 4 features):
+      cb_buy_pct_30s     - Coinbase buy volume % in last 30s
+      bb_buy_pct_30s     - Bybit buy volume % in last 30s
+      cb_leads_binance_5s - Coinbase price change 5s ago vs Binance now
+      volume_share_binance - Binance fraction of total volume
+    """
+    f = {}
+
+    if not _has_cross_exchange(day):
+        # Return NaN for all cross-exchange features so model handles gracefully
+        for col in CROSS_EXCHANGE_COLUMNS:
+            f[col] = np.nan
+        return f
+
+    # --- Binance spot mid (reference) ---
+    bi = _last_before(day.bs_ts, T_ms)
+    binance_mid = day.bs_mid[bi] if bi >= 0 else 0.0
+
+    # === RONDA 1: Quotes ===
+
+    # Coinbase spread
+    ci = _last_before(day.cb_ts, T_ms)
+    if ci >= 0:
+        cb_mid = day.cb_mid[ci]
+        cb_spread = day.cb_ask[ci] - day.cb_bid[ci]
+        f['cb_spread_bps'] = _safe_div(cb_spread, cb_mid) * 10_000
+    else:
+        cb_mid = 0.0
+        f['cb_spread_bps'] = np.nan
+
+    # Bybit spread
+    bbi = _last_before(day.bb_ts, T_ms)
+    if bbi >= 0:
+        bb_mid = day.bb_mid[bbi]
+        bb_spread = day.bb_ask[bbi] - day.bb_bid[bbi]
+        f['bb_spread_bps'] = _safe_div(bb_spread, bb_mid) * 10_000
+    else:
+        bb_mid = 0.0
+        f['bb_spread_bps'] = np.nan
+
+    # Cross-exchange price divergence
+    if binance_mid > 0 and cb_mid > 0:
+        f['cb_vs_binance_bps'] = _safe_div(cb_mid - binance_mid, binance_mid) * 10_000
+    else:
+        f['cb_vs_binance_bps'] = np.nan
+
+    if binance_mid > 0 and bb_mid > 0:
+        f['bb_vs_binance_bps'] = _safe_div(bb_mid - binance_mid, binance_mid) * 10_000
+    else:
+        f['bb_vs_binance_bps'] = np.nan
+
+    # Cross-exchange consensus
+    cb_div = f['cb_vs_binance_bps']
+    bb_div = f['bb_vs_binance_bps']
+    if not np.isnan(cb_div) and not np.isnan(bb_div):
+        f['cross_mean_vs_binance'] = (cb_div + bb_div) / 2.0
+    elif not np.isnan(cb_div):
+        f['cross_mean_vs_binance'] = cb_div
+    elif not np.isnan(bb_div):
+        f['cross_mean_vs_binance'] = bb_div
+    else:
+        f['cross_mean_vs_binance'] = np.nan
+
+    # Price dispersion across 3 exchanges
+    mids = [m for m in [binance_mid, cb_mid, bb_mid] if m > 0]
+    if len(mids) >= 2:
+        mean_mid = np.mean(mids)
+        f['cross_price_std_bps'] = float(np.std(mids) / mean_mid * 10_000)
+    else:
+        f['cross_price_std_bps'] = np.nan
+
+    # === RONDA 2: Trades ===
+
+    # Coinbase buy_pct 30s
+    if hasattr(day, 'ct_ts') and len(day.ct_ts) > 0:
+        i0, i1 = _slice_window(day.ct_ts, T_ms - 30_000, T_ms)
+        if i1 > i0:
+            q = day.ct_qty[i0:i1]
+            ibm = day.ct_ibm[i0:i1]
+            buy_vol = q[~ibm].sum()
+            f['cb_buy_pct_30s'] = _safe_div(buy_vol, q.sum(), 0.5)
+        else:
+            f['cb_buy_pct_30s'] = 0.5
+    else:
+        f['cb_buy_pct_30s'] = np.nan
+
+    # Bybit buy_pct 30s
+    if hasattr(day, 'bt_ts') and len(day.bt_ts) > 0:
+        i0, i1 = _slice_window(day.bt_ts, T_ms - 30_000, T_ms)
+        if i1 > i0:
+            q = day.bt_qty[i0:i1]
+            ibm = day.bt_ibm[i0:i1]
+            buy_vol = q[~ibm].sum()
+            f['bb_buy_pct_30s'] = _safe_div(buy_vol, q.sum(), 0.5)
+        else:
+            f['bb_buy_pct_30s'] = 0.5
+    else:
+        f['bb_buy_pct_30s'] = np.nan
+
+    # Coinbase leads Binance 5s (price change in CB 5s ago vs Binance now)
+    if hasattr(day, 'ct_ts') and len(day.ct_ts) > 0 and bi >= 0:
+        # CB price 5s ago vs CB price 10s ago → CB return in that window
+        ci_5 = _last_before(day.cb_ts, T_ms - 5_000)
+        ci_10 = _last_before(day.cb_ts, T_ms - 10_000)
+        if ci_5 >= 0 and ci_10 >= 0 and day.cb_mid[ci_10] > 0:
+            cb_return_5s_ago = _safe_div(
+                day.cb_mid[ci_5] - day.cb_mid[ci_10], day.cb_mid[ci_10]) * 10_000
+        else:
+            cb_return_5s_ago = 0.0
+
+        # Binance return over last 5s
+        bi_5 = _last_before(day.bs_ts, T_ms - 5_000)
+        if bi_5 >= 0 and day.bs_mid[bi_5] > 0:
+            bn_return_now = _safe_div(
+                binance_mid - day.bs_mid[bi_5], day.bs_mid[bi_5]) * 10_000
+        else:
+            bn_return_now = 0.0
+
+        # Lead = CB moved 5s ago but Binance hasn't caught up yet
+        f['cb_leads_binance_5s'] = cb_return_5s_ago - bn_return_now
+    else:
+        f['cb_leads_binance_5s'] = np.nan
+
+    # Volume share: Binance / total across 3 exchanges (30s window)
+    bn_vol = 0.0
+    cb_vol = 0.0
+    bb_vol = 0.0
+
+    i0, i1 = _slice_window(day.ts_ts, T_ms - 30_000, T_ms)
+    if i1 > i0:
+        bn_vol = float(day.ts_qty[i0:i1].sum())
+
+    if hasattr(day, 'ct_ts') and len(day.ct_ts) > 0:
+        i0, i1 = _slice_window(day.ct_ts, T_ms - 30_000, T_ms)
+        if i1 > i0:
+            cb_vol = float(day.ct_qty[i0:i1].sum())
+
+    if hasattr(day, 'bt_ts') and len(day.bt_ts) > 0:
+        i0, i1 = _slice_window(day.bt_ts, T_ms - 30_000, T_ms)
+        if i1 > i0:
+            bb_vol = float(day.bt_qty[i0:i1].sum())
+
+    total_vol = bn_vol + cb_vol + bb_vol
+    if total_vol > 0:
+        f['volume_share_binance'] = bn_vol / total_vol
+    else:
+        f['volume_share_binance'] = np.nan
+
+    return f
+
+
+# Cross-exchange column names (used for NaN defaults when data missing)
+CROSS_EXCHANGE_COLUMNS = [
+    # Ronda 1: quotes
+    "cb_spread_bps", "bb_spread_bps",
+    "cb_vs_binance_bps", "bb_vs_binance_bps",
+    "cross_mean_vs_binance", "cross_price_std_bps",
+    # Ronda 2: trades
+    "cb_buy_pct_30s", "bb_buy_pct_30s",
+    "cb_leads_binance_5s", "volume_share_binance",
+]
+
+
+# ---------------------------------------------------------------------------
 # Feature column list (programmatically generated)
 # ---------------------------------------------------------------------------
 
@@ -1190,6 +1433,9 @@ def _build_feature_columns():
         "vpin_30s", "vpin_signed_30s", "vpin_120s", "vpin_spike",
     ]
 
+    # Group K: Cross-exchange (10)
+    cols += CROSS_EXCHANGE_COLUMNS
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -1269,5 +1515,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group J: VPIN
     feats.update(compute_vpin(day, T_ms))
+
+    # Group K: Cross-exchange
+    feats.update(compute_cross_exchange(day, T_ms))
 
     return feats

@@ -358,25 +358,31 @@ def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
 
     Replays L2 updates to reconstruct the book, taking snapshots every 100ms.
     Output format matches book_snapshot_25.
+
+    Memory optimization: extracts arrays immediately, deletes the DataFrame,
+    and limits SortedDict size to top 50 levels per side.
     """
     import numpy as np
     from sortedcontainers import SortedDict
+    import gc
 
     # Convert timestamp to ms
     if "timestamp" in df.columns and len(df) > 0 and df["timestamp"].iloc[0] > 1e15:
         df["timestamp"] = df["timestamp"] // 1000
 
-    timestamps = df["timestamp"].values
-    is_snapshots = df["is_snapshot"].values if "is_snapshot" in df.columns else np.zeros(len(df), dtype=bool)
-    sides = df["side"].values
-    prices = df["price"].values.astype(np.float64)
-    amounts = df["amount"].values.astype(np.float64)
+    # Extract arrays and free the DataFrame immediately
+    timestamps = df["timestamp"].values.copy()
+    sides = df["side"].values.copy()
+    prices = df["price"].values.astype(np.float64).copy()
+    amounts = df["amount"].values.astype(np.float64).copy()
+    del df
+    gc.collect()
 
     bids = SortedDict()   # price -> amount (sorted ascending, we read from end)
     asks = SortedDict()   # price -> amount (sorted ascending, we read from start)
 
-    # Pre-allocate arrays for snapshots
-    max_snaps = len(df) // 50 + 1000  # rough estimate
+    # Pre-allocate arrays for snapshots (~864K snapshots max for 24h at 100ms)
+    max_snaps = min(len(timestamps) // 50 + 1000, 900_000)
     snap_ts = np.zeros(max_snaps, dtype=np.int64)
     snap_bids_p = np.zeros((max_snaps, 20), dtype=np.float64)
     snap_bids_q = np.zeros((max_snaps, 20), dtype=np.float64)
@@ -386,6 +392,7 @@ def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
     last_snap_ts = 0
     snap_interval_ms = 100
     snap_idx = 0
+    MAX_BOOK_DEPTH = 50  # Keep only top 50 levels to limit memory
 
     for i in range(len(timestamps)):
         ts = int(timestamps[i])
@@ -398,6 +405,16 @@ def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
             book.pop(price, None)
         else:
             book[price] = amount
+
+        # Trim book to MAX_BOOK_DEPTH levels to prevent unbounded growth
+        if len(bids) > MAX_BOOK_DEPTH * 2:
+            # Remove lowest bids (far from best)
+            while len(bids) > MAX_BOOK_DEPTH:
+                bids.popitem(0)  # Remove lowest price
+        if len(asks) > MAX_BOOK_DEPTH * 2:
+            # Remove highest asks (far from best)
+            while len(asks) > MAX_BOOK_DEPTH:
+                asks.popitem(-1)  # Remove highest price
 
         # Take snapshot at interval
         if ts - last_snap_ts >= snap_interval_ms and len(bids) >= 20 and len(asks) >= 20:
@@ -425,12 +442,17 @@ def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
 
             if snap_idx >= max_snaps:
                 # Grow arrays
-                snap_ts = np.resize(snap_ts, max_snaps * 2)
-                snap_bids_p = np.resize(snap_bids_p, (max_snaps * 2, 20))
-                snap_bids_q = np.resize(snap_bids_q, (max_snaps * 2, 20))
-                snap_asks_p = np.resize(snap_asks_p, (max_snaps * 2, 20))
-                snap_asks_q = np.resize(snap_asks_q, (max_snaps * 2, 20))
-                max_snaps *= 2
+                new_max = max_snaps * 2
+                snap_ts = np.resize(snap_ts, new_max)
+                snap_bids_p = np.resize(snap_bids_p, (new_max, 20))
+                snap_bids_q = np.resize(snap_bids_q, (new_max, 20))
+                snap_asks_p = np.resize(snap_asks_p, (new_max, 20))
+                snap_asks_q = np.resize(snap_asks_q, (new_max, 20))
+                max_snaps = new_max
+
+    # Free input arrays
+    del timestamps, sides, prices, amounts
+    gc.collect()
 
     if snap_idx == 0:
         cols = ["timestamp_ms", "recv_ts"]
@@ -446,6 +468,9 @@ def _process_incremental_book_l2(df: pd.DataFrame) -> pd.DataFrame:
         result[f"ask_price_{j}"] = snap_asks_p[:snap_idx, j]
         result[f"ask_qty_{j}"] = snap_asks_q[:snap_idx, j]
 
+    del snap_ts, snap_bids_p, snap_bids_q, snap_asks_p, snap_asks_q
+    gc.collect()
+
     return pd.DataFrame(result)
 
 
@@ -459,6 +484,7 @@ def _save_parquet(df: pd.DataFrame, date_str: str, stream: str) -> int:
 
 def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
     """Download one tardis dataset for one day. Returns (status, rows, bytes)."""
+    import gc
     ds = TARDIS_DATASETS[ds_name]
     out_path = OUTPUT_DIR / date_str / ds["output_stream"] / "full_day.parquet"
     if out_path.exists():
@@ -480,7 +506,10 @@ def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
     if post == "incremental_book_l2":
         df = _process_incremental_book_l2(df)
         file_size = _save_parquet(df, date_str, ds["output_stream"])
-        return "done", len(df), dl_bytes
+        n_rows = len(df)
+        del df
+        gc.collect()
+        return "done", n_rows, dl_bytes
 
     if "column_map" in ds:
         df = _apply_column_map(df, ds["column_map"])
@@ -747,6 +776,10 @@ Examples:
                         help="Show download status only")
     parser.add_argument("--cross-only", action="store_true",
                         help="Download only cross-exchange data (Coinbase + Bybit)")
+    parser.add_argument("--skip-book", action="store_true",
+                        help="Skip cb_book_l2 (memory-intensive, download separately)")
+    parser.add_argument("--book-only", action="store_true",
+                        help="Download ONLY cb_book_l2 (use --workers 1)")
     args = parser.parse_args()
 
     # Date range
@@ -782,11 +815,26 @@ Examples:
 
     # Create jobs
     cross_only = getattr(args, 'cross_only', False)
-    all_jobs = create_jobs(start_date, end_date, cross_only=cross_only)
-    total_days = (end_date - start_date).days
+    skip_book = getattr(args, 'skip_book', False)
+    book_only = getattr(args, 'book_only', False)
 
-    mode = "CROSS-EXCHANGE ONLY (Coinbase + Bybit)" if cross_only else "ALL"
-    n_ds = len(CROSS_EXCHANGE_DATASETS) if cross_only else len(TARDIS_DATASETS) + 1
+    if book_only:
+        # Only download cb_book_l2
+        all_jobs = create_jobs(start_date, end_date, cross_only=True)
+        all_jobs = [(s, d, dt) for s, d, dt in all_jobs if d == "cb_book_l2"]
+        mode = "CB_BOOK_L2 ONLY"
+        n_ds = 1
+    else:
+        all_jobs = create_jobs(start_date, end_date, cross_only=cross_only)
+        if skip_book:
+            all_jobs = [(s, d, dt) for s, d, dt in all_jobs if d != "cb_book_l2"]
+            mode = ("CROSS-EXCHANGE (skip book)" if cross_only else "ALL (skip book)")
+            n_ds = (len(CROSS_EXCHANGE_DATASETS) - 1) if cross_only else len(TARDIS_DATASETS)
+        else:
+            mode = "CROSS-EXCHANGE ONLY (Coinbase + Bybit)" if cross_only else "ALL"
+            n_ds = len(CROSS_EXCHANGE_DATASETS) if cross_only else len(TARDIS_DATASETS) + 1
+
+    total_days = (end_date - start_date).days
 
     print(f"{'='*60}")
     print(f"  Download: {start_date.date()} to {end_date.date()} ({total_days} days)")

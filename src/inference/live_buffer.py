@@ -71,6 +71,28 @@ class LiveBuffer:
         self.mt_taker_ls = []
         self.mt_oi = []
 
+        # --- Cross-exchange: Coinbase quotes ---
+        self.cb_ts = []
+        self.cb_bid = []
+        self.cb_ask = []
+
+        # --- Cross-exchange: Bybit quotes ---
+        self.bb_ts = []
+        self.bb_bid = []
+        self.bb_ask = []
+
+        # --- Cross-exchange: Coinbase trades ---
+        self.ct_ts = []
+        self.ct_price = []
+        self.ct_qty = []
+        self.ct_ibm = []
+
+        # --- Cross-exchange: Bybit trades ---
+        self.bt_ts = []
+        self.bt_price = []
+        self.bt_qty = []
+        self.bt_ibm = []
+
     # --- Add methods for each stream ---
 
     def add_trade_futures(self, timestamp_ms, price, qty, is_buyer_maker):
@@ -130,6 +152,28 @@ class LiveBuffer:
         self.mt_taker_ls.append(taker_ls)
         self.mt_oi.append(oi)
 
+    def add_coinbase_quote(self, timestamp_ms, bid, ask):
+        self.cb_ts.append(timestamp_ms)
+        self.cb_bid.append(bid)
+        self.cb_ask.append(ask)
+
+    def add_bybit_quote(self, timestamp_ms, bid, ask):
+        self.bb_ts.append(timestamp_ms)
+        self.bb_bid.append(bid)
+        self.bb_ask.append(ask)
+
+    def add_coinbase_trade(self, timestamp_ms, price, qty, is_buyer_maker):
+        self.ct_ts.append(timestamp_ms)
+        self.ct_price.append(price)
+        self.ct_qty.append(qty)
+        self.ct_ibm.append(is_buyer_maker)
+
+    def add_bybit_trade(self, timestamp_ms, price, qty, is_buyer_maker):
+        self.bt_ts.append(timestamp_ms)
+        self.bt_price.append(price)
+        self.bt_qty.append(qty)
+        self.bt_ibm.append(is_buyer_maker)
+
     # --- Trim old data ---
 
     def trim(self, now_ms=None):
@@ -165,6 +209,12 @@ class LiveBuffer:
                    self.mp_next_ms)
         _trim_list(self.lq_ts, self.lq_is_buy, self.lq_qty)
         # Don't trim metrics — we need lagged bars
+
+        # Cross-exchange
+        _trim_list(self.cb_ts, self.cb_bid, self.cb_ask)
+        _trim_list(self.bb_ts, self.bb_bid, self.bb_ask)
+        _trim_list(self.ct_ts, self.ct_price, self.ct_qty, self.ct_ibm)
+        _trim_list(self.bt_ts, self.bt_price, self.bt_qty, self.bt_ibm)
 
     # --- Convert to DayData ---
 
@@ -258,6 +308,34 @@ class LiveBuffer:
         day.mt_taker_ls = np.array(self.mt_taker_ls[:n], dtype=np.float64)
         day.mt_oi = np.array(self.mt_oi[:n], dtype=np.float64)
 
+        # Coinbase quotes
+        n = len(self.cb_ts)
+        day.cb_ts  = np.array(self.cb_ts[:n], dtype=np.int64)
+        day.cb_bid = np.array(self.cb_bid[:n], dtype=np.float64)
+        day.cb_ask = np.array(self.cb_ask[:n], dtype=np.float64)
+        day.cb_mid = (day.cb_bid + day.cb_ask) / 2.0 if n > 0 else np.array([])
+
+        # Bybit quotes
+        n = len(self.bb_ts)
+        day.bb_ts  = np.array(self.bb_ts[:n], dtype=np.int64)
+        day.bb_bid = np.array(self.bb_bid[:n], dtype=np.float64)
+        day.bb_ask = np.array(self.bb_ask[:n], dtype=np.float64)
+        day.bb_mid = (day.bb_bid + day.bb_ask) / 2.0 if n > 0 else np.array([])
+
+        # Coinbase trades
+        n = len(self.ct_ts)
+        day.ct_ts    = np.array(self.ct_ts[:n], dtype=np.int64)
+        day.ct_price = np.array(self.ct_price[:n], dtype=np.float64)
+        day.ct_qty   = np.array(self.ct_qty[:n], dtype=np.float64)
+        day.ct_ibm   = np.array(self.ct_ibm[:n], dtype=bool)
+
+        # Bybit trades
+        n = len(self.bt_ts)
+        day.bt_ts    = np.array(self.bt_ts[:n], dtype=np.int64)
+        day.bt_price = np.array(self.bt_price[:n], dtype=np.float64)
+        day.bt_qty   = np.array(self.bt_qty[:n], dtype=np.float64)
+        day.bt_ibm   = np.array(self.bt_ibm[:n], dtype=bool)
+
         return day
 
     def stats(self):
@@ -272,4 +350,8 @@ class LiveBuffer:
             "mark_price": len(self.mp_ts),
             "liquidations": len(self.lq_ts),
             "metrics": len(self.mt_ts),
+            "coinbase_quotes": len(self.cb_ts),
+            "bybit_quotes": len(self.bb_ts),
+            "coinbase_trades": len(self.ct_ts),
+            "bybit_trades": len(self.bt_ts),
         }
