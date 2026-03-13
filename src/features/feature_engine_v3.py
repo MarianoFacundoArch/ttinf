@@ -1188,6 +1188,159 @@ def compute_orderbook_at_open(day, T_ms, open_ref):
 
 
 # ---------------------------------------------------------------------------
+# GROUP L: Pre-block features (9 features) — Ronda 4
+#
+# What happened in the 30-60 seconds BEFORE the block started?
+# Fills the "blind spot" between coarse prev_block returns and block start.
+# ---------------------------------------------------------------------------
+
+PREBLOCK_COLUMNS = [
+    "pb_momentum_30s",      # Price return in 30s before block open
+    "pb_momentum_10s",      # Price return in 10s before block open
+    "pb_acceleration",      # momentum_10s - momentum_30s
+    "pb_net_flow_30s",      # (buy_vol - sell_vol) / total_vol last 30s
+    "pb_net_flow_10s",      # Same but last 10s
+    "pb_trade_intensity",   # trades/sec last 30s ÷ trades/sec last 5min
+    "pb_vol_30s",           # Realized vol last 30s (std of 1s returns)
+    "pb_vol_ratio",         # vol_30s ÷ vol_5min
+    "pb_liq_pressure_60s",  # Liq volume / total trade volume last 60s
+]
+
+
+def compute_preblock(day, block_start_ms):
+    """
+    Pre-block features: what was happening 30-60s before the block opened.
+
+    Uses futures trades (highest liquidity) for momentum and flow.
+    These features are STATIC throughout the block — computed once at block start.
+    """
+    f = {}
+
+    # Time windows (all relative to block_start_ms, looking BACKWARDS)
+    t0 = block_start_ms
+    t_10 = t0 - 10_000    # 10s before
+    t_30 = t0 - 30_000    # 30s before
+    t_60 = t0 - 60_000    # 60s before
+    t_5m = t0 - 300_000   # 5min before
+
+    # --- Momentum: price return before block open ---
+    # Use futures trades for best liquidity
+    ts = day.ft_ts
+    prices = day.ft_price
+
+    # Price at block open (last trade before t0)
+    idx_0 = _last_before(ts, t0)
+    # Price 10s before
+    idx_10 = _last_before(ts, t_10)
+    # Price 30s before
+    idx_30 = _last_before(ts, t_30)
+
+    if idx_0 >= 0 and idx_30 >= 0 and prices[idx_0] > 0 and prices[idx_30] > 0:
+        p0 = prices[idx_0]
+        p30 = prices[idx_30]
+        f["pb_momentum_30s"] = (p0 - p30) / p30 * 10_000  # bps
+    else:
+        f["pb_momentum_30s"] = 0.0
+
+    if idx_0 >= 0 and idx_10 >= 0 and prices[idx_0] > 0 and prices[idx_10] > 0:
+        p0 = prices[idx_0]
+        p10 = prices[idx_10]
+        f["pb_momentum_10s"] = (p0 - p10) / p10 * 10_000  # bps
+    else:
+        f["pb_momentum_10s"] = 0.0
+
+    # Acceleration: is the move speeding up or slowing down?
+    f["pb_acceleration"] = f["pb_momentum_10s"] - f["pb_momentum_30s"]
+
+    # --- Net flow: who's the aggressor? ---
+    i_start_30, i_end_30 = _slice_window(ts, t_30, t0)
+    if i_end_30 > i_start_30:
+        qty_slice = day.ft_qty[i_start_30:i_end_30]
+        ibm_slice = day.ft_ibm[i_start_30:i_end_30]
+        buy_vol = qty_slice[~ibm_slice].sum()   # is_buyer_maker=False → buyer is taker
+        sell_vol = qty_slice[ibm_slice].sum()    # is_buyer_maker=True → seller is taker
+        total = buy_vol + sell_vol
+        f["pb_net_flow_30s"] = float((buy_vol - sell_vol) / total) if total > 0 else 0.0
+    else:
+        f["pb_net_flow_30s"] = 0.0
+
+    i_start_10, i_end_10 = _slice_window(ts, t_10, t0)
+    if i_end_10 > i_start_10:
+        qty_slice = day.ft_qty[i_start_10:i_end_10]
+        ibm_slice = day.ft_ibm[i_start_10:i_end_10]
+        buy_vol = qty_slice[~ibm_slice].sum()
+        sell_vol = qty_slice[ibm_slice].sum()
+        total = buy_vol + sell_vol
+        f["pb_net_flow_10s"] = float((buy_vol - sell_vol) / total) if total > 0 else 0.0
+    else:
+        f["pb_net_flow_10s"] = 0.0
+
+    # --- Trade intensity: is the market unusually active? ---
+    n_trades_30s = i_end_30 - i_start_30
+    i_start_5m, i_end_5m = _slice_window(ts, t_5m, t0)
+    n_trades_5m = i_end_5m - i_start_5m
+
+    rate_30s = n_trades_30s / 30.0
+    rate_5m = n_trades_5m / 300.0 if n_trades_5m > 0 else 1.0
+    f["pb_trade_intensity"] = float(rate_30s / rate_5m) if rate_5m > 0 else 1.0
+
+    # --- Realized vol last 30s (std of 1-second returns) ---
+    # Build 1-second price series in [t_30, t0]
+    if i_end_30 - i_start_30 > 10:
+        ts_slice = ts[i_start_30:i_end_30]
+        px_slice = prices[i_start_30:i_end_30]
+        # Sample at 1-second intervals
+        sec_prices = []
+        for sec in range(30):
+            sec_ms = t_30 + sec * 1000
+            idx = np.searchsorted(ts_slice, sec_ms, side='right') - 1
+            if idx >= 0:
+                sec_prices.append(px_slice[idx])
+        if len(sec_prices) > 2:
+            sec_prices = np.array(sec_prices)
+            returns = np.diff(sec_prices) / sec_prices[:-1]
+            f["pb_vol_30s"] = float(np.std(returns)) * 10_000  # bps
+        else:
+            f["pb_vol_30s"] = 0.0
+    else:
+        f["pb_vol_30s"] = 0.0
+
+    # --- Vol ratio: vol_30s / vol_5min ---
+    # Compute 5min vol the same way
+    if i_end_5m - i_start_5m > 10:
+        ts_5m_slice = ts[i_start_5m:i_end_5m]
+        px_5m_slice = prices[i_start_5m:i_end_5m]
+        sec_prices_5m = []
+        for sec in range(0, 300, 5):  # 5-second intervals for efficiency
+            sec_ms = t_5m + sec * 1000
+            idx = np.searchsorted(ts_5m_slice, sec_ms, side='right') - 1
+            if idx >= 0:
+                sec_prices_5m.append(px_5m_slice[idx])
+        if len(sec_prices_5m) > 2:
+            sec_prices_5m = np.array(sec_prices_5m)
+            returns_5m = np.diff(sec_prices_5m) / sec_prices_5m[:-1]
+            vol_5m = float(np.std(returns_5m)) * 10_000
+            f["pb_vol_ratio"] = f["pb_vol_30s"] / vol_5m if vol_5m > 0 else 1.0
+        else:
+            f["pb_vol_ratio"] = 1.0
+    else:
+        f["pb_vol_ratio"] = 1.0
+
+    # --- Liquidation pressure: forced vs organic ---
+    if hasattr(day, 'lq_ts') and len(day.lq_ts) > 0:
+        li_s, li_e = _slice_window(day.lq_ts, t_60, t0)
+        liq_vol = day.lq_qty[li_s:li_e].sum() if li_e > li_s else 0.0
+        # Total trade volume in last 60s
+        ti_s, ti_e = _slice_window(ts, t_60, t0)
+        trade_vol = day.ft_qty[ti_s:ti_e].sum() if ti_e > ti_s else 0.0
+        f["pb_liq_pressure_60s"] = float(liq_vol / trade_vol) if trade_vol > 0 else 0.0
+    else:
+        f["pb_liq_pressure_60s"] = 0.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # GROUP K: Cross-exchange features (Ronda 1: 6 quotes + Ronda 2: 4 trades)
 # ---------------------------------------------------------------------------
 
@@ -1538,8 +1691,11 @@ def _build_feature_columns():
         "vpin_30s", "vpin_signed_30s", "vpin_120s", "vpin_spike",
     ]
 
-    # Group K: Cross-exchange (10)
+    # Group K: Cross-exchange (15)
     cols += CROSS_EXCHANGE_COLUMNS
+
+    # Group L: Pre-block (9)
+    cols += PREBLOCK_COLUMNS
 
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
@@ -1623,5 +1779,8 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
 
     # Group K: Cross-exchange
     feats.update(compute_cross_exchange(day, T_ms, open_ref=open_ref))
+
+    # Group L: Pre-block (static — computed from data before block_start_ms)
+    feats.update(compute_preblock(day, block_start_ms))
 
     return feats

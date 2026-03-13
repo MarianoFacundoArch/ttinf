@@ -158,6 +158,12 @@ FEATURE_GROUPS = {
         "cb_ob_near_open", "bb_ob_near_open",
         "cross_imbalance_consensus",
     ],
+    "preblock": [
+        "pb_momentum_30s", "pb_momentum_10s", "pb_acceleration",
+        "pb_net_flow_30s", "pb_net_flow_10s",
+        "pb_trade_intensity", "pb_vol_30s", "pb_vol_ratio",
+        "pb_liq_pressure_60s",
+    ],
 }
 
 
