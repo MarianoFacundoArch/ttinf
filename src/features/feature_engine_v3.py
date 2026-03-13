@@ -2111,25 +2111,49 @@ THEORETICAL_COLUMNS = [
 
 
 def _get_1s_returns(ref, T_ms, n_seconds):
-    """Get array of 1-second returns (in bps) for the last n_seconds."""
-    returns = []
-    for lag in range(n_seconds):
-        t_end = T_ms - lag * 1000
-        t_start = t_end - 1000
-        i_end = _last_before(ref['ts'], t_end)
-        i_start = _last_before(ref['ts'], t_start)
-        if i_end >= 0 and i_start >= 0 and ref['price'][i_start] > 0:
-            r = _safe_div(ref['price'][i_end] - ref['price'][i_start],
-                          ref['price'][i_start]) * 10_000
-            returns.append(r)
-        else:
-            returns.append(0.0)
-    return np.array(returns)
+    """Get array of 1-second returns (in bps) for the last n_seconds.
+
+    Optimized: direct indexing into 1s grid instead of binary search per second.
+    """
+    ref_ts0 = ref['ts'][0]
+    ref_len = len(ref['ts'])
+    prices = ref['price']
+
+    idx_now = int((T_ms - ref_ts0) // 1000)
+    idx_start = idx_now - n_seconds
+
+    idx_start = max(0, idx_start)
+    idx_now = min(ref_len - 1, idx_now)
+
+    if idx_now - idx_start < 2:
+        return np.zeros(n_seconds)
+
+    p = prices[idx_start:idx_now + 1]
+    denom = p[:-1]
+    safe = denom > 0
+    rets_forward = np.zeros(len(p) - 1)
+    rets_forward[safe] = (p[1:][safe] - denom[safe]) / denom[safe] * 10_000
+
+    rets = rets_forward[::-1]
+
+    if len(rets) < n_seconds:
+        rets = np.concatenate([rets, np.zeros(n_seconds - len(rets))])
+    else:
+        rets = rets[:n_seconds]
+
+    return rets
 
 
 def compute_theoretical(day, ref, T_ms, block_start_ms, open_ref):
     """Compute theoretical & statistical features (Group R)."""
     f = {}
+
+    ref_ts0 = ref['ts'][0]
+    ref_len = len(ref['ts'])
+    prices = ref['price']
+
+    def _ref_idx(t_ms):
+        return max(0, min(ref_len - 1, int((t_ms - ref_ts0) // 1000)))
 
     # Get 1-second returns for various windows
     rets_30 = _get_1s_returns(ref, T_ms, 30)
@@ -2159,20 +2183,13 @@ def compute_theoretical(day, ref, T_ms, block_start_ms, open_ref):
     # theta = -slope. Positive = mean-reverting.
     # ---------------------------------------------------------------
     if len(rets_60) >= 10:
-        # Build price path relative to open
-        prices = []
-        for lag in range(60, -1, -1):
-            idx = _last_before(ref['ts'], T_ms - lag * 1000)
-            if idx >= 0:
-                prices.append(ref['price'][idx] - open_ref)
-            elif prices:
-                prices.append(prices[-1])
-            else:
-                prices.append(0.0)
-        prices = np.array(prices)
-        if len(prices) >= 3:
-            dx = np.diff(prices)
-            x = prices[:-1]
+        # Build price path relative to open (direct slice)
+        idx_end = _ref_idx(T_ms)
+        idx_start = _ref_idx(T_ms - 60_000)
+        price_path = prices[idx_start:idx_end + 1] - open_ref
+        if len(price_path) >= 3:
+            dx = np.diff(price_path)
+            x = price_path[:-1]
             # Simple regression: theta = -cov(dx, x) / var(x)
             var_x = np.var(x)
             if var_x > 1e-15:
@@ -2258,8 +2275,8 @@ def compute_theoretical(day, ref, T_ms, block_start_ms, open_ref):
     # #8 Distance to nearest round number (bps)
     # Round numbers: multiples of 1000 and 5000 in USD
     # ---------------------------------------------------------------
-    ref_idx = _last_before(ref['ts'], T_ms)
-    price_now = ref['price'][ref_idx] if ref_idx >= 0 else open_ref
+    ref_idx = _ref_idx(T_ms)
+    price_now = prices[ref_idx]
     if price_now > 0:
         # Find nearest multiples of 1000 and 5000
         r1000 = round(price_now / 1000) * 1000
@@ -2344,24 +2361,32 @@ def compute_theoretical(day, ref, T_ms, block_start_ms, open_ref):
     # OBV: +vol when price up, -vol when price down. Normalized [-1,1].
     # Simplified: use 1-second price bars and aggregate volume per bar.
     # ---------------------------------------------------------------
-    i0_block, i1_block = _slice_window(ref['ts'], block_start_ms, T_ms)
+    i0_block = _ref_idx(block_start_ms)
+    i1_block = _ref_idx(T_ms) + 1
+    i1_block = min(i1_block, ref_len)
+
     if i1_block - i0_block >= 2:
-        block_prices = ref['price'][i0_block:i1_block]
-        block_ts = ref['ts'][i0_block:i1_block]
-        # Compute OBV using ref price direction and trade volume in each 1s bar
-        obv = 0.0
-        total_v = 0.0
-        for i in range(1, len(block_prices)):
-            t0_bar = int(block_ts[i - 1])
-            t1_bar = int(block_ts[i])
-            ti0, ti1 = _slice_window(day.tf_ts, t0_bar, t1_bar)
-            vol_bar = float(np.sum(day.tf_qty[ti0:ti1])) if ti1 > ti0 else 0.0
-            total_v += vol_bar
-            if block_prices[i] > block_prices[i - 1]:
-                obv += vol_bar
-            elif block_prices[i] < block_prices[i - 1]:
-                obv -= vol_bar
-        f["obv_norm"] = float(obv / total_v) if total_v > 0 else 0.0
+        block_prices = prices[i0_block:i1_block]
+        n_bars = i1_block - i0_block
+        block_ts_start = int(ref['ts'][i0_block])
+        block_ts_end = int(ref['ts'][i1_block - 1])
+
+        # Pre-bin all trade volume into 1-second buckets (vectorized)
+        ti0, ti1 = _slice_window(day.tf_ts, block_ts_start, block_ts_end + 1000)
+        if ti1 > ti0:
+            trade_ts = day.tf_ts[ti0:ti1]
+            trade_qty = day.tf_qty[ti0:ti1]
+            bucket_idx = ((trade_ts - block_ts_start) // 1000).astype(np.intp)
+            bucket_idx = np.clip(bucket_idx, 0, n_bars - 1)
+            vol_per_bar = np.bincount(bucket_idx, weights=trade_qty, minlength=n_bars)
+        else:
+            vol_per_bar = np.zeros(n_bars)
+
+        direction = np.sign(np.diff(block_prices))
+        bar_vols = vol_per_bar[:n_bars - 1]
+        obv_val = float(np.sum(direction * bar_vols))
+        total_v = float(np.sum(bar_vols))
+        f["obv_norm"] = float(obv_val / total_v) if total_v > 0 else 0.0
     else:
         f["obv_norm"] = 0.0
 
@@ -2371,9 +2396,8 @@ def compute_theoretical(day, ref, T_ms, block_start_ms, open_ref):
     # without crossing. Many bounces = open is strong support/resistance.
     # ---------------------------------------------------------------
     if i1_block - i0_block >= 3 and open_ref > 0:
-        block_prices = ref['price'][i0_block:i1_block]
-        threshold_bps = 1.0
-        threshold_abs = open_ref * threshold_bps / 10_000
+        block_prices = prices[i0_block:i1_block]
+        threshold_abs = open_ref * 1.0 / 10_000
         bounces = 0
         in_zone = False
         entered_side = 0  # 1 = from above, -1 = from below
