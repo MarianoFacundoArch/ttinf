@@ -306,10 +306,24 @@ def _tardis_download_csv(exchange: str, data_type: str, date_str: str,
     url = f"{TARDIS_BASE}/{exchange}/{data_type}/{year}/{month}/{day}/{sym}.csv.gz"
     headers = {"Authorization": f"Bearer {TARDIS_API_KEY}"} if TARDIS_API_KEY else {}
 
-    resp = requests.get(url, headers=headers, timeout=600)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=120)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                # Rate limited — wait and retry
+                wait = 10 * (attempt + 1)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
 
     raw = gzip.decompress(resp.content)
     return pd.read_csv(io.BytesIO(raw)), len(resp.content)
