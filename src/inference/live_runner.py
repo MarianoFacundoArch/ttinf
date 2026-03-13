@@ -85,7 +85,11 @@ def get_bucket_stats(seconds_to_expiry):
 # ---------------------------------------------------------------------------
 
 class WSHealth:
-    """Track last message time for each websocket connection."""
+    """Track last message time and reconnection gaps for each websocket."""
+
+    # Longest feature window is 120s (VPIN). After reconnection, data may
+    # be incomplete until this many seconds of fresh data have accumulated.
+    DATA_COMPLETE_WINDOW_S = 120
 
     def __init__(self):
         self.last_msg = {
@@ -94,9 +98,24 @@ class WSHealth:
             "coinbase": 0.0,
             "bybit": 0.0,
         }
+        # Track when each source last reconnected (had a gap > 5s)
+        self._last_reconnect = {
+            "binance_futures": 0.0,
+            "binance_spot": 0.0,
+            "coinbase": 0.0,
+            "bybit": 0.0,
+        }
 
     def update(self, source):
-        self.last_msg[source] = time.time()
+        now = time.time()
+        prev = self.last_msg[source]
+        # Detect reconnection: gap > 5s since last message
+        if prev > 0 and (now - prev) > 5.0:
+            self._last_reconnect[source] = now
+        # First message ever also counts as reconnect
+        elif prev == 0.0:
+            self._last_reconnect[source] = now
+        self.last_msg[source] = now
 
     def age(self, source):
         t = self.last_msg[source]
@@ -108,6 +127,27 @@ class WSHealth:
     def binance_ok(self):
         """Binance futures must be fresh to predict."""
         return self.is_fresh("binance_futures", 5.0)
+
+    def seconds_since_reconnect(self, source):
+        """Seconds since last reconnection for a source."""
+        t = self._last_reconnect[source]
+        return time.time() - t if t > 0 else float('inf')
+
+    def data_complete(self):
+        """True if all critical sources have enough data since last reconnect."""
+        for src in ["binance_futures", "binance_spot"]:
+            if self.seconds_since_reconnect(src) < self.DATA_COMPLETE_WINDOW_S:
+                return False
+        return True
+
+    def time_until_complete(self):
+        """Seconds until data is considered complete (0 if already complete)."""
+        worst = 0.0
+        for src in ["binance_futures", "binance_spot"]:
+            remaining = self.DATA_COMPLETE_WINDOW_S - self.seconds_since_reconnect(src)
+            if remaining > worst:
+                worst = remaining
+        return max(0.0, worst)
 
     def status_line(self):
         parts = []
@@ -692,6 +732,8 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 signal = "FLAT ~  "
 
             warming = len(predictor.block_results) == 0
+            data_incomplete = health and not health.data_complete()
+            incomplete_secs = health.time_until_complete() if health else 0
 
             acc_bucket, ece_bucket = get_bucket_stats(secs)
             max_buy_up = round(p_cal - ece_bucket, 3)
@@ -702,13 +744,15 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             else:
                 buy_side = f"BUY DN < ${max_buy_down:.3f}"
 
+            incomplete_tag = f" [INCOMPLETE {incomplete_secs:.0f}s]" if data_incomplete else ""
+
             print(f"  {now_str} | {secs:5.0f}s | "
                   f"BTC {price:>10,.2f} | "
                   f"vs open: {dist:>+7.2f} bps | "
                   f"P(Up): {p_cal:.3f} | "
                   f"acc: {acc_bucket:.1%} | "
                   f"{buy_side} | "
-                  f"{signal}")
+                  f"{signal}{incomplete_tag}")
             if warming:
                 print(" *** WARMING UP ***")
 
@@ -731,6 +775,8 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     "max_buy_down": max_buy_down,
                     "direction": result["direction"],
                     "warming_up": warming,
+                    "data_incomplete": data_incomplete,
+                    "data_complete_in_s": round(incomplete_secs, 0) if data_incomplete else 0,
                 })
                 dead = set()
                 for client in ws_clients:
