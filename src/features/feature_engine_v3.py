@@ -266,6 +266,42 @@ def load_day_data(date_str, data_dir=None):
         day.bt_qty   = np.array([], dtype=np.float64)
         day.bt_ibm   = np.array([], dtype=bool)
 
+    # --- Cross-exchange: Coinbase orderbook (from incremental L2) ---
+    path = d / "coinbase_book_l2" / "full_day.parquet"
+    if path.exists():
+        df = pq.read_table(path).to_pandas()
+        ts = df["timestamp_ms"].values.astype(np.int64)
+        bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
+        bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
+        ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
+        aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
+        day.ob_cb = _precompute_book(ts, bp, bq, ap, aq)
+        del df, ts, bp, bq, ap, aq
+    else:
+        day.ob_cb = {'ts': np.array([], dtype=np.int64),
+                     'mid': np.array([]), 'spread_bps': np.array([]),
+                     'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                     'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                     'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
+
+    # --- Cross-exchange: Bybit orderbook ---
+    path = d / "bybit_orderbook" / "full_day.parquet"
+    if path.exists():
+        df = pq.read_table(path).to_pandas()
+        ts = df["timestamp_ms"].values.astype(np.int64)
+        bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
+        bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
+        ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
+        aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
+        day.ob_bb = _precompute_book(ts, bp, bq, ap, aq)
+        del df, ts, bp, bq, ap, aq
+    else:
+        day.ob_bb = {'ts': np.array([], dtype=np.int64),
+                     'mid': np.array([]), 'spread_bps': np.array([]),
+                     'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                     'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                     'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
+
     return day
 
 
@@ -1160,7 +1196,7 @@ def _has_cross_exchange(day):
     return hasattr(day, 'cb_ts') and hasattr(day, 'bb_ts')
 
 
-def compute_cross_exchange(day, T_ms):
+def compute_cross_exchange(day, T_ms, open_ref=0.0):
     """Cross-exchange features from Coinbase and Bybit quotes + trades.
 
     Ronda 1 (quotes - 6 features):
@@ -1319,6 +1355,71 @@ def compute_cross_exchange(day, T_ms):
     else:
         f['volume_share_binance'] = np.nan
 
+    # === RONDA 3: Depth (orderbook) ===
+
+    # Imbalance L5 from cross-exchange orderbooks
+    for pfx, ob_key in [("cb", "ob_cb"), ("bb", "ob_bb")]:
+        ob = getattr(day, ob_key, None)
+        if ob is not None and len(ob['ts']) > 0:
+            idx = _last_before(ob['ts'], T_ms)
+            if idx >= 0:
+                f[f'{pfx}_imbalance_L5'] = float(ob['imb_L5'][idx])
+            else:
+                f[f'{pfx}_imbalance_L5'] = np.nan
+        else:
+            f[f'{pfx}_imbalance_L5'] = np.nan
+
+    # Volume near open price from cross-exchange orderbooks
+    THRESHOLD_BPS = 10
+    for pfx, ob_key in [("cb", "ob_cb"), ("bb", "ob_bb")]:
+        ob = getattr(day, ob_key, None)
+        if ob is not None and len(ob['ts']) > 0 and open_ref > 0:
+            idx = _last_before(ob['ts'], T_ms)
+            if idx >= 0 and 'bid_prices' in ob and len(ob['bid_prices']) > 0:
+                bp = ob['bid_prices'][idx]
+                bq = ob['bid_qtys'][idx]
+                ap = ob['ask_prices'][idx]
+                aq = ob['ask_qtys'][idx]
+
+                # Translate open_ref to this exchange's price space
+                # using the cross-exchange spread
+                threshold = open_ref * THRESHOLD_BPS / 10_000
+
+                bid_valid = bp > 0
+                bid_near = bid_valid & (bp >= open_ref - threshold) & (bp <= open_ref)
+                ask_valid = ap > 0
+                ask_near = ask_valid & (ap >= open_ref) & (ap <= open_ref + threshold)
+
+                bid_near_vol = bq[bid_near].sum()
+                ask_near_vol = aq[ask_near].sum()
+                total_near = bid_near_vol + ask_near_vol
+
+                f[f'{pfx}_ob_near_open'] = float(
+                    (bid_near_vol - ask_near_vol) / total_near if total_near > 0 else 0.0)
+            else:
+                f[f'{pfx}_ob_near_open'] = np.nan
+        else:
+            f[f'{pfx}_ob_near_open'] = np.nan
+
+    # Cross-exchange imbalance consensus (average L5 across all 3 exchanges)
+    imbalances = []
+    # Binance futures imbalance
+    if len(day.ob_fut['ts']) > 0:
+        idx = _last_before(day.ob_fut['ts'], T_ms)
+        if idx >= 0:
+            imbalances.append(float(day.ob_fut['imb_L5'][idx]))
+    # Coinbase
+    if not np.isnan(f.get('cb_imbalance_L5', np.nan)):
+        imbalances.append(f['cb_imbalance_L5'])
+    # Bybit
+    if not np.isnan(f.get('bb_imbalance_L5', np.nan)):
+        imbalances.append(f['bb_imbalance_L5'])
+
+    if len(imbalances) >= 2:
+        f['cross_imbalance_consensus'] = float(np.mean(imbalances))
+    else:
+        f['cross_imbalance_consensus'] = np.nan
+
     return f
 
 
@@ -1331,6 +1432,10 @@ CROSS_EXCHANGE_COLUMNS = [
     # Ronda 2: trades
     "cb_buy_pct_30s", "bb_buy_pct_30s",
     "cb_leads_binance_5s", "volume_share_binance",
+    # Ronda 3: depth
+    "cb_imbalance_L5", "bb_imbalance_L5",
+    "cb_ob_near_open", "bb_ob_near_open",
+    "cross_imbalance_consensus",
 ]
 
 
@@ -1517,6 +1622,6 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
     feats.update(compute_vpin(day, T_ms))
 
     # Group K: Cross-exchange
-    feats.update(compute_cross_exchange(day, T_ms))
+    feats.update(compute_cross_exchange(day, T_ms, open_ref=open_ref))
 
     return feats

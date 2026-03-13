@@ -154,6 +154,9 @@ FEATURE_GROUPS = {
         "cross_mean_vs_binance", "cross_price_std_bps",
         "cb_buy_pct_30s", "bb_buy_pct_30s",
         "cb_leads_binance_5s", "volume_share_binance",
+        "cb_imbalance_L5", "bb_imbalance_L5",
+        "cb_ob_near_open", "bb_ob_near_open",
+        "cross_imbalance_consensus",
     ],
 }
 

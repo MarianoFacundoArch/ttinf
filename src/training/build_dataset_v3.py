@@ -160,6 +160,16 @@ def _merge_day_data(main_day, extra_day, prepend=True):
         main_day.bt_qty   = np.concatenate([first.bt_qty, second.bt_qty])
         main_day.bt_ibm   = np.concatenate([first.bt_ibm, second.bt_ibm])
 
+    # Cross-exchange: Coinbase orderbook
+    if hasattr(first, 'ob_cb') and hasattr(second, 'ob_cb'):
+        for key in first.ob_cb:
+            main_day.ob_cb[key] = np.concatenate([first.ob_cb[key], second.ob_cb[key]])
+
+    # Cross-exchange: Bybit orderbook
+    if hasattr(first, 'ob_bb') and hasattr(second, 'ob_bb'):
+        for key in first.ob_bb:
+            main_day.ob_bb[key] = np.concatenate([first.ob_bb[key], second.ob_bb[key]])
+
     return main_day
 
 
