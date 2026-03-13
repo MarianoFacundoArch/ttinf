@@ -64,7 +64,7 @@ PARAMS = {
     "num_threads":      -1,
 }
 
-NUM_BOOST_ROUND = 3000
+NUM_BOOST_ROUND = 5000
 EARLY_STOPPING  = 500
 
 # Features to exclude when using residual mode (brownian as init_score)
