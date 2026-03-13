@@ -148,6 +148,13 @@ FEATURE_GROUPS = {
     "vpin": [
         "vpin_30s", "vpin_signed_30s", "vpin_120s", "vpin_spike",
     ],
+    "cross_exchange": [
+        "cb_spread_bps", "bb_spread_bps",
+        "cb_vs_binance_bps", "bb_vs_binance_bps",
+        "cross_mean_vs_binance", "cross_price_std_bps",
+        "cb_buy_pct_30s", "bb_buy_pct_30s",
+        "cb_leads_binance_5s", "volume_share_binance",
+    ],
 }
 
 
