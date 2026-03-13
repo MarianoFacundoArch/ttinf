@@ -1334,6 +1334,209 @@ def compute_preblock(day, block_start_ms):
 
 
 # ---------------------------------------------------------------------------
+# GROUP M: Previous block structure (2 features) — Ronda 5
+#
+# HOW the previous block behaved, not just its return.
+# Static per block — computed once from trades in [block_start - 300s, block_start].
+# ---------------------------------------------------------------------------
+
+PREV_BLOCK_COLUMNS = [
+    "prev_trend_linearity",   # R² of price vs time — clean trend vs choppy
+    "prev_volume_profile",    # vol last 60s / vol first 60s of prev block
+]
+
+
+def compute_prev_block_structure(day, block_start_ms):
+    """Structure of the previous block (300s window before block_start).
+
+    These capture HOW the previous block behaved — its shape, not just
+    its return. Static throughout the current block.
+    """
+    f = {}
+    BLOCK_DUR = 300_000  # 5 minutes
+
+    prev_start = block_start_ms - BLOCK_DUR
+    prev_end = block_start_ms
+
+    ts = day.tf_ts
+    prices = day.tf_price
+
+    i0, i1 = _slice_window(ts, prev_start, prev_end)
+
+    if i1 - i0 < 20:
+        f["prev_trend_linearity"] = 0.0
+        f["prev_volume_profile"] = 1.0
+        return f
+
+    # --- prev_trend_linearity: R² of price vs time ---
+    t_slice = ts[i0:i1].astype(np.float64)
+    p_slice = prices[i0:i1].astype(np.float64)
+    # Normalize time to [0, 1] for numerical stability
+    t_norm = (t_slice - t_slice[0]) / max(1.0, float(t_slice[-1] - t_slice[0]))
+    # R² = correlation² (faster than full regression)
+    corr_matrix = np.corrcoef(t_norm, p_slice)
+    r = corr_matrix[0, 1]
+    f["prev_trend_linearity"] = float(r * r) if np.isfinite(r) else 0.0
+
+    # --- prev_volume_profile: vol last 60s / vol first 60s ---
+    qty = day.tf_qty[i0:i1]
+    ts_local = ts[i0:i1]
+    first_60_end = prev_start + 60_000
+    last_60_start = prev_end - 60_000
+
+    first_mask = ts_local < first_60_end
+    last_mask = ts_local >= last_60_start
+    vol_first = qty[first_mask].sum()
+    vol_last = qty[last_mask].sum()
+    f["prev_volume_profile"] = float(vol_last / vol_first) if vol_first > 0 else 1.0
+
+    return f
+
+
+# ---------------------------------------------------------------------------
+# GROUP N: Market microstructure dynamics (4 features) — Ronda 5
+#
+# Features from data we already collect but don't exploit.
+# ---------------------------------------------------------------------------
+
+MICRO_DYNAMICS_COLUMNS = [
+    "return_autocorr_30s",       # Autocorrelation of 1s returns — trending vs mean-reverting
+    "price_impact_30s",          # Price change per unit signed volume — market fragility
+    "ob_seconds_to_cross_open",  # Depth to open / flow per second — difficulty to cross target
+    "ob_depth_concentration",    # Vol L1-5 / Vol L1-20 — orderbook shape
+]
+
+
+def compute_micro_dynamics(day, ref, T_ms, open_ref):
+    """Advanced microstructure dynamics features.
+
+    These measure properties of the market that no existing feature captures:
+    trending vs mean-reverting, market fragility, and orderbook shape.
+    """
+    f = {}
+
+    # --- return_autocorr_30s: autocorrelation of 1-second returns ---
+    ts = day.tf_ts
+    prices = day.tf_price
+    i0_30, i1_30 = _slice_window(ts, T_ms - 30_000, T_ms)
+
+    if i1_30 - i0_30 > 30:
+        ts_slice = ts[i0_30:i1_30]
+        px_slice = prices[i0_30:i1_30]
+        # Sample at 1-second intervals
+        sec_grid = np.arange(T_ms - 30_000, T_ms, 1000)
+        sec_idx = np.searchsorted(ts_slice, sec_grid, side='right') - 1
+        valid = sec_idx >= 0
+        if valid.sum() > 5:
+            sec_px = px_slice[sec_idx[valid]]
+            rets = np.diff(sec_px) / sec_px[:-1]
+            if len(rets) > 3 and np.std(rets) > 0:
+                # Lag-1 autocorrelation
+                f["return_autocorr_30s"] = float(np.corrcoef(rets[:-1], rets[1:])[0, 1])
+                if not np.isfinite(f["return_autocorr_30s"]):
+                    f["return_autocorr_30s"] = 0.0
+            else:
+                f["return_autocorr_30s"] = 0.0
+        else:
+            f["return_autocorr_30s"] = 0.0
+    else:
+        f["return_autocorr_30s"] = 0.0
+
+    # --- price_impact_30s: price change per unit of signed volume ---
+    # Kyle's lambda: how fragile is the market?
+    if i1_30 - i0_30 > 20:
+        qty_slice = day.tf_qty[i0_30:i1_30]
+        ibm_slice = day.tf_ibm[i0_30:i1_30]
+        signed_vol = np.where(ibm_slice, -qty_slice, qty_slice)
+        cum_signed = np.cumsum(signed_vol)
+        px_slice = prices[i0_30:i1_30]
+        px_returns = (px_slice - px_slice[0]) / px_slice[0] * 10_000  # bps from start
+
+        # Simple: total price change / total signed volume
+        total_signed = cum_signed[-1]
+        total_px_change = px_returns[-1]
+        # Require meaningful signed volume (at least 0.1 BTC net)
+        if abs(total_signed) > 0.1:
+            impact = float(total_px_change / total_signed)
+            # Clip to [-50, 50] bps per BTC to avoid outliers
+            f["price_impact_30s"] = max(-50.0, min(50.0, impact))
+        else:
+            f["price_impact_30s"] = 0.0
+    else:
+        f["price_impact_30s"] = 0.0
+
+    # --- ob_seconds_to_cross_open: depth to open / flow per second ---
+    ob = day.ob_fut
+    has_raw = ('bid_prices' in ob and len(ob['bid_prices']) > 0)
+
+    if has_raw and open_ref > 0 and len(ob['ts']) > 0:
+        idx = _last_before(ob['ts'], T_ms)
+        if idx >= 0:
+            bp = ob['bid_prices'][idx]
+            bq = ob['bid_qtys'][idx]
+            ap = ob['ask_prices'][idx]
+            aq = ob['ask_qtys'][idx]
+
+            mid = (bp[0] + ap[0]) / 2.0 if bp[0] > 0 and ap[0] > 0 else 0.0
+
+            # Volume between current price and open
+            cross_vol = 0.0
+            if mid > open_ref:
+                # Price above open — need to eat through bids to go below
+                valid = (bp > 0) & (bp >= open_ref)
+                cross_vol = bq[valid].sum()
+            elif mid < open_ref:
+                # Price below open — need to eat through asks to go above
+                valid = (ap > 0) & (ap <= open_ref)
+                cross_vol = aq[valid].sum()
+
+            # Flow rate: average volume per second in last 30s
+            if i1_30 > i0_30:
+                total_trade_vol = day.tf_qty[i0_30:i1_30].sum()
+                flow_per_sec = total_trade_vol / 30.0
+                if flow_per_sec > 0:
+                    # Cap at 300s (one block) — beyond that it's "very hard"
+                    secs = float(cross_vol / flow_per_sec)
+                    f["ob_seconds_to_cross_open"] = min(300.0, secs)
+                else:
+                    f["ob_seconds_to_cross_open"] = 0.0
+            else:
+                f["ob_seconds_to_cross_open"] = 0.0
+        else:
+            f["ob_seconds_to_cross_open"] = 0.0
+    else:
+        f["ob_seconds_to_cross_open"] = 0.0
+
+    # --- ob_depth_concentration: vol L1-5 / vol L1-20 ---
+    if has_raw and len(ob['ts']) > 0:
+        idx = _last_before(ob['ts'], T_ms)
+        if idx >= 0:
+            bp = ob['bid_prices'][idx]
+            bq = ob['bid_qtys'][idx]
+            ap = ob['ask_prices'][idx]
+            aq = ob['ask_qtys'][idx]
+
+            bid_valid = bp > 0
+            ask_valid = ap > 0
+            total_vol = bq[bid_valid].sum() + aq[ask_valid].sum()
+
+            if total_vol > 0:
+                # Top 5 levels each side
+                bid_5 = bq[bid_valid][:5].sum()
+                ask_5 = aq[ask_valid][:5].sum()
+                near_vol = bid_5 + ask_5
+                f["ob_depth_concentration"] = float(near_vol / total_vol)
+            else:
+                f["ob_depth_concentration"] = 0.5
+        else:
+            f["ob_depth_concentration"] = 0.5
+    else:
+        f["ob_depth_concentration"] = 0.5
+
+    return f
+
+
+# ---------------------------------------------------------------------------
 # GROUP K: Cross-exchange features (Ronda 1: 6 quotes + Ronda 2: 4 trades)
 # ---------------------------------------------------------------------------
 
@@ -1690,6 +1893,12 @@ def _build_feature_columns():
     # Group L: Pre-block (9)
     cols += PREBLOCK_COLUMNS
 
+    # Group M: Previous block structure (2)
+    cols += PREV_BLOCK_COLUMNS
+
+    # Group N: Market microstructure dynamics (4)
+    cols += MICRO_DYNAMICS_COLUMNS
+
     # Deduplicate (minutes_to_funding appears in C and E)
     seen = set()
     deduped = []
@@ -1790,5 +1999,17 @@ def compute_features_v3(day, ref, T_ms, block_start_ms, open_ref,
         feats.update(pb)
         if block_cache is not None:
             block_cache['preblock'] = pb
+
+    # Group M: Previous block structure (STATIC per block — cache)
+    if block_cache is not None and 'prev_block' in block_cache:
+        feats.update(block_cache['prev_block'])
+    else:
+        pvb = compute_prev_block_structure(day, block_start_ms)
+        feats.update(pvb)
+        if block_cache is not None:
+            block_cache['prev_block'] = pvb
+
+    # Group N: Market microstructure dynamics (dynamic)
+    feats.update(compute_micro_dynamics(day, ref, T_ms, open_ref))
 
     return feats
