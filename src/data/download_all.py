@@ -505,6 +505,8 @@ def download_tardis_job(ds_name: str, date_str: str) -> tuple[str, int, int]:
         return "skip", 0, 0
 
     symbol = ds.get("symbol")  # None for Binance (uses global SYMBOL)
+    sys.stdout.write(f"\r\033[K  ⏳ {ds_name} {date_str}: downloading...\n")
+    sys.stdout.flush()
     result = _tardis_download_csv(ds["exchange"], ds["data_type"], date_str,
                                   symbol=symbol)
     if result is None:
