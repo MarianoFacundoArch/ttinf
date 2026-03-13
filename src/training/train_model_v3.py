@@ -551,8 +551,12 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
     n_dates = len(dates)
     embargo_blocks = 2  # 10 minutes = 2 blocks
 
-    print(f"\nWalk-forward: {n_dates} days, train={train_days}d, test={test_days}d, "
-          f"step={step_days}d, embargo={embargo_blocks} blocks")
+    n_features = len(FEATURE_COLUMNS_V3)
+    n_rows = len(df)
+    n_folds = (n_dates - train_days - test_days) // step_days + 1
+    print(f"\nWalk-forward: {n_dates} days, {n_rows:,} rows, {n_features} features")
+    print(f"  train={train_days}d, test={test_days}d, step={step_days}d, "
+          f"embargo={embargo_blocks} blocks, ~{n_folds} folds")
 
     all_results = []
     fold = 0
@@ -603,8 +607,8 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7):
         df_calib = df_train_full.loc[calib_mask]
 
         print(f"\n--- Fold {fold}: train {min(train_dates)}..{max(train_dates)} "
-              f"({len(df_train):,} train, {len(df_calib):,} calib), "
-              f"test {min(test_dates)}..{max(test_dates)} ({len(df_test):,}) ---")
+              f"({len(train_dates)} days, {len(df_train):,} train, {len(df_calib):,} calib), "
+              f"test {min(test_dates)}..{max(test_dates)} ({len(test_dates)} days, {len(df_test):,} rows) ---")
 
         X_train = df_train[FEATURE_COLUMNS_V3].values
         y_train = df_train["target"].values.astype(int)
