@@ -31,6 +31,21 @@ from src.inference.live_predictor import LivePredictor
 # ---------------------------------------------------------------------------
 
 POLYMARKET_CRYPTO_API = "https://polymarket.com/api/crypto/crypto-price"
+POLYMARKET_LIVE_WS = "wss://ws-live-data.polymarket.com/"
+
+
+class ChainlinkPriceFeed:
+    """Real-time Chainlink BTC/USD price from Polymarket websocket."""
+
+    def __init__(self):
+        self.price = 0.0
+        self.received_at = 0.0  # time.time() when last price arrived
+
+    @property
+    def age(self):
+        if self.received_at == 0:
+            return float('inf')
+        return time.time() - self.received_at
 
 
 class PolymarketTracker:
@@ -46,6 +61,7 @@ class PolymarketTracker:
         self.price_to_beat = None     # Strike price from Polymarket
         self._polling = False         # True while polling for price
         self.enabled = False          # Set to True to activate
+        self.chainlink = ChainlinkPriceFeed()  # Real-time Chainlink price
 
     def get_block_open_ts(self, now_sec=None):
         """Get the current block's open timestamp in seconds."""
@@ -117,6 +133,63 @@ async def polymarket_poller(tracker, session, stop_event):
         except Exception as e:
             print(f"\n  [polymarket] error: {e}")
             await asyncio.sleep(2)
+
+
+async def ws_chainlink_stream(tracker, stop_event):
+    """Connect to Polymarket live-data WS for Chainlink BTC/USD price."""
+    if not tracker.enabled:
+        return
+
+    sub_msg = json.dumps({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "update",
+            "filters": json.dumps({"symbol": "btc/usd"}),
+        }],
+    })
+
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(POLYMARKET_LIVE_WS, ssl=SSL_CONTEXT,
+                                          ping_interval=30,
+                                          ping_timeout=20) as ws:
+                await ws.send(sub_msg)
+                print("  [chainlink] Connected to Polymarket price feed")
+                async for msg in ws:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        raw = msg if isinstance(msg, str) else msg.decode()
+                        if not raw.strip():
+                            continue
+                        d = json.loads(raw)
+                        payload = d.get("payload")
+                        if not payload:
+                            continue
+
+                        # Format 1: initial snapshot with data array
+                        if isinstance(payload, dict) and "data" in payload:
+                            data = payload["data"]
+                            if isinstance(data, list) and len(data) > 0:
+                                last = data[-1]
+                                tracker.chainlink.price = float(last["value"])
+                                tracker.chainlink.received_at = time.time()
+                                print(f"  [chainlink] Initial: "
+                                      f"${tracker.chainlink.price:,.2f}")
+
+                        # Format 2: individual update with value
+                        elif isinstance(payload, dict) and "value" in payload:
+                            tracker.chainlink.price = float(payload["value"])
+                            tracker.chainlink.received_at = time.time()
+
+                    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                        pass
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"\n  [chainlink] reconnecting: {e}")
+                await asyncio.sleep(5)
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -772,8 +845,10 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 print(f"\n  [health] {health.status_line()}")
                 last_health_log = time.time()
 
-            # Polymarket mode: wait for price_to_beat
+            # Polymarket mode: check block transitions and wait for price_to_beat
             if poly_tracker and poly_tracker.enabled:
+                # Also check for new block here to prevent race with poller
+                poly_tracker.check_new_block()
                 if poly_tracker.price_to_beat is None:
                     if time.time() - last_no_market_log > 5:
                         secs_into = int(time.time()) - poly_tracker.current_open_ts
@@ -825,10 +900,20 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             ).strftime("%H:%M:%S")
 
             secs = result["seconds_to_expiry"]
-            dist = result["dist_to_open_bps"]
             p_cal = result["p_calibrated"]
             p_bm = result["brownian_prob"]
-            price = result["price_now"]
+
+            # In polymarket mode, show Chainlink price and dist vs strike
+            poly_mode = poly_tracker and poly_tracker.enabled
+            if poly_mode and poly_tracker.chainlink.price > 0 and poly_tracker.chainlink.age < 30:
+                price = poly_tracker.chainlink.price
+                strike = poly_tracker.price_to_beat
+                dist = (price - strike) / strike * 10_000
+                price_src = "CL"
+            else:
+                price = result["price_now"]
+                dist = result["dist_to_open_bps"]
+                price_src = "BN"
 
             if p_cal >= 0.65:
                 signal = "UP  ^^^"
@@ -856,9 +941,11 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
 
             incomplete_tag = f" [INCOMPLETE {incomplete_secs:.0f}s]" if data_incomplete else ""
 
+            price_label = f"BTC({price_src})" if poly_mode else "BTC"
+            open_label_short = "vs strike" if poly_mode else "vs open"
             print(f"  {now_str} | {secs:5.0f}s | "
-                  f"BTC {price:>10,.2f} | "
-                  f"vs open: {dist:>+7.2f} bps | "
+                  f"{price_label} {price:>10,.2f} | "
+                  f"{open_label_short}: {dist:>+7.2f} bps | "
                   f"P(Up): {p_cal:.3f} | "
                   f"acc: {acc_bucket:.1%} | "
                   f"{buy_side} | "
@@ -891,6 +978,9 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 if poly_tracker and poly_tracker.enabled:
                     ws_data["polymarket_mode"] = True
                     ws_data["price_to_beat"] = poly_tracker.price_to_beat
+                    if poly_tracker.chainlink.price > 0:
+                        ws_data["chainlink_price"] = poly_tracker.chainlink.price
+                        ws_data["chainlink_age_ms"] = round(poly_tracker.chainlink.age * 1000)
                 payload = json.dumps(ws_data)
                 dead = set()
                 for client in ws_clients:
@@ -964,6 +1054,7 @@ async def main(interval=1, ws_port=8765, use_polymarket=False):
                 ws_bybit_stream(buffer, health, stop_event),
                 metrics_poller(buffer, session, stop_event),
                 polymarket_poller(poly_tracker, session, stop_event),
+                ws_chainlink_stream(poly_tracker, stop_event),
                 prediction_loop(buffer, predictor, interval, stop_event,
                                 health, ws_clients, poly_tracker),
             )
