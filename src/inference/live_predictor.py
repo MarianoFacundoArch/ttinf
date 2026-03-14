@@ -130,6 +130,8 @@ class LivePredictor:
                 self.block_results.insert(0, {
                     'return_bps': float(return_bps),
                     'result': result,
+                    'close_ref': float(close_ref),
+                    'open_ref': float(self.open_ref),
                 })
                 # Keep only last 6
                 self.block_results = self.block_results[:6]
@@ -250,7 +252,6 @@ class LivePredictor:
             "dist_to_open_bps": feats.get("dist_to_open_bps", 0.0),
             "p_raw": p_raw,
             "p_calibrated": p_cal,
-            "confidence": abs(p_cal - 0.5),
             "direction": "UP" if p_cal >= 0.5 else "DOWN",
             "brownian_prob": feats.get("brownian_prob", 0.5),
         }

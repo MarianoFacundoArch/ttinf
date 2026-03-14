@@ -906,6 +906,15 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
 
             # New block?
             if result["block_start_ms"] != last_block:
+                # Show close summary of previous block
+                if last_block > 0 and len(predictor.block_results) > 0:
+                    prev = predictor.block_results[0]
+                    outcome = "UP" if prev['result'] == 1 else "DOWN"
+                    print(f"\n  >> CLOSED: {prev['close_ref']:,.2f}  |  "
+                          f"open: {prev['open_ref']:,.2f}  |  "
+                          f"{prev['return_bps']:+.2f} bps  |  "
+                          f"{outcome}")
+
                 last_block = result["block_start_ms"]
                 block_count += 1
                 block_time = datetime.fromtimestamp(
@@ -939,22 +948,11 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 price = result["price_now"]
                 dist = result["dist_to_open_bps"]
 
-            if p_cal >= 0.65:
-                signal = "UP  ^^^"
-            elif p_cal >= 0.55:
-                signal = "UP  ^  "
-            elif p_cal <= 0.35:
-                signal = "DOWN vvv"
-            elif p_cal <= 0.45:
-                signal = "DOWN v  "
-            else:
-                signal = "FLAT ~  "
-
             warming = len(predictor.block_results) == 0
             data_incomplete = health and not health.data_complete()
             incomplete_secs = health.time_until_complete() if health else 0
 
-            acc_bucket, ece_bucket = get_bucket_stats(secs)
+            _, ece_bucket = get_bucket_stats(secs)
             max_buy_up = round(p_cal - ece_bucket, 3)
             max_buy_down = round((1.0 - p_cal) - ece_bucket, 3)
 
@@ -970,9 +968,7 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                   f"BTC {price:>10,.2f} | "
                   f"{open_label_short}: {dist:>+7.2f} bps | "
                   f"P(Up): {p_cal:.3f} | "
-                  f"acc: {acc_bucket:.1%} | "
-                  f"{buy_side} | "
-                  f"{signal}{incomplete_tag}")
+                  f"{buy_side}{incomplete_tag}")
             if warming:
                 print(" *** WARMING UP ***")
 
@@ -989,7 +985,6 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     "p_down": round(1.0 - float(p_cal), 4),
                     "brownian_prob": round(float(p_bm), 4),
                     "edge_vs_brownian": round(float(p_cal - p_bm), 4),
-                    "accuracy_at_bucket": round(acc_bucket, 4),
                     "ece_at_bucket": round(ece_bucket, 4),
                     "max_buy_up": max_buy_up,
                     "max_buy_down": max_buy_down,
@@ -998,6 +993,13 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     "data_incomplete": data_incomplete,
                     "data_complete_in_s": round(incomplete_secs, 0) if data_incomplete else 0,
                 }
+                # Include last closed block result
+                if len(predictor.block_results) > 0:
+                    prev = predictor.block_results[0]
+                    ws_data["last_block_close"] = prev.get("close_ref")
+                    ws_data["last_block_open"] = prev.get("open_ref")
+                    ws_data["last_block_return_bps"] = prev.get("return_bps")
+                    ws_data["last_block_result"] = "UP" if prev["result"] == 1 else "DOWN"
                 if poly_mode:
                     ws_data["polymarket_mode"] = True
                     ws_data["price_to_beat"] = poly_tracker.price_to_beat
