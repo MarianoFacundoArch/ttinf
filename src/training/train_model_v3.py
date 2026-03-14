@@ -724,7 +724,27 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7, residual=False):
         test_dist = df_test["dist_to_open_bps"].values
         test_vol = df_test["realized_vol_60s"].values
         y_cal_test = apply_calibrators(test_proba, test_seconds, calibrators)
+        y_cal_test = np.clip(y_cal_test, 0.01, 0.99)
         bm_proba = baseline_brownian(test_dist, test_vol, test_seconds)
+
+        # --- Calibrated metrics (what production actually uses) ---
+        cal_acc = accuracy_score(y_test, (y_cal_test >= 0.5).astype(int))
+        cal_ll = log_loss(y_test, np.column_stack([1 - y_cal_test, y_cal_test]), labels=[0, 1])
+        cal_brier = brier_score_loss(y_test, y_cal_test)
+        try:
+            cal_auc = roc_auc_score(y_test, y_cal_test)
+        except ValueError:
+            cal_auc = 0.5
+        bm_acc = accuracy_score(y_test, (bm_proba >= 0.5).astype(int))
+        bm_ll = log_loss(y_test, np.column_stack([1 - bm_proba, bm_proba]), labels=[0, 1])
+        bm_brier = brier_score_loss(y_test, bm_proba)
+        result["cal_accuracy"] = cal_acc
+        result["cal_logloss"] = cal_ll
+        result["cal_brier"] = cal_brier
+        result["cal_auc"] = cal_auc
+        result["cal_delta_vs_bm_acc"] = cal_acc - bm_acc
+        result["cal_delta_vs_bm_ll"] = bm_ll - cal_ll
+        result["cal_delta_vs_bm_brier"] = bm_brier - cal_brier
 
         model_dir = (y_cal_test >= 0.5).astype(int)  # 1=UP, 0=DOWN
         bm_dir = (bm_proba >= 0.5).astype(int)
@@ -896,6 +916,20 @@ def walk_forward(df, train_days=56, test_days=14, step_days=7, residual=False):
               f"delta_acc={best_fold['delta_vs_bm_acc']:+.4f})")
         print(f"  Worst fold: {worst_fold['fold']} ({worst_fold['test_start']} to {worst_fold['test_end']}, "
               f"delta_acc={worst_fold['delta_vs_bm_acc']:+.4f})")
+
+        # --- Calibrated summary (what production actually uses) ---
+        print(f"\n{'='*70}")
+        print(f"  POST-CALIBRATION SUMMARY ({len(all_results)} folds) — PRODUCTION METRICS")
+        print(f"{'='*70}")
+        for metric in ["cal_accuracy", "cal_logloss", "cal_brier", "cal_auc",
+                        "cal_delta_vs_bm_acc", "cal_delta_vs_bm_ll", "cal_delta_vs_bm_brier"]:
+            vals = [r[metric] for r in all_results if metric in r]
+            if vals:
+                label = metric.replace("cal_", "")
+                print(f"  {label:<20s}: mean={np.mean(vals):.4f}, std={np.std(vals):.4f}, "
+                      f"min={np.min(vals):.4f}, max={np.max(vals):.4f}")
+        cal_bm_wins = sum(1 for r in all_results if r.get("cal_delta_vs_bm_acc", 0) > 0)
+        print(f"\n  Consistency: Calibrated model > Brownian in {cal_bm_wins}/{len(all_results)} folds")
 
         # Phase summary across all folds
         print(f"\n  ACCURACY BY PHASE (averaged across {len(all_results)} folds)")

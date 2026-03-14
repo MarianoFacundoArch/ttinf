@@ -372,18 +372,21 @@ async def warmup(buffer, session):
     now_ms = int(time.time() * 1000)
     print("Warming up...")
 
-    # 1. Klines 1m futures (last 60 min for ref_price)
+    # 1. Index price klines (last 60 min for ref_price)
+    # Uses indexPriceKlines for accurate index_price (not futures close which
+    # has basis/premium vs index). ref_price is built from index_price.
     try:
-        url = f"{FUTURES_REST}/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=60"
+        url = f"{FUTURES_REST}/fapi/v1/indexPriceKlines?pair=BTCUSDT&interval=1m&limit=60"
         async with session.get(url, ssl=SSL_CONTEXT) as r:
             data = await r.json()
             for k in data:
                 ts = int(k[0])
-                close = float(k[4])
-                buffer.add_mark_price(ts, close, close, 0.0, 0)
-            print(f"  klines 1m: {len(data)} bars")
+                index_close = float(k[4])
+                # mark_price not available from index klines, use index as approximation
+                buffer.add_mark_price(ts, index_close, index_close, 0.0, 0)
+            print(f"  indexPriceKlines 1m: {len(data)} bars")
     except Exception as e:
-        print(f"  klines 1m: ERROR {e}")
+        print(f"  indexPriceKlines 1m: ERROR {e}")
 
     # 2. Premium index (current mark, index, funding)
     try:
@@ -654,14 +657,16 @@ async def ws_spot_stream(buffer, health, stop_event):
                                 int(d["T"]), float(d["p"]), float(d["q"]), d["m"]
                             )
                         elif "bookTicker" in stream:
+                            # Spot bookTicker has no T/E timestamp field (only u,s,b,B,a,A)
+                            # Fallback to local arrival time — consistent with training data
                             ts = int(d.get("T", d.get("E", time.time() * 1000)))
                             buffer.add_bookticker_spot(
                                 ts, float(d["b"]), float(d["a"])
                             )
                         elif "depth20" in stream:
                             ts = int(d.get("T", d.get("E", time.time() * 1000)))
-                            bids = d["b"]
-                            asks = d["a"]
+                            bids = d.get("bids", d.get("b", []))
+                            asks = d.get("asks", d.get("a", []))
                             bp = [float(b[0]) for b in bids[:20]]
                             bq = [float(b[1]) for b in bids[:20]]
                             ap = [float(a[0]) for a in asks[:20]]
@@ -677,12 +682,52 @@ async def ws_spot_stream(buffer, health, stop_event):
                 await asyncio.sleep(2)
 
 
+def _coinbase_auth_headers():
+    """Build Coinbase WS auth signature if API keys are configured.
+
+    Reads from environment variables:
+        COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_API_PASSPHRASE
+
+    Returns dict with auth fields for the subscribe message, or empty dict.
+    """
+    import os, hmac, hashlib, base64
+    key = os.environ.get("COINBASE_API_KEY", "")
+    secret = os.environ.get("COINBASE_API_SECRET", "")
+    passphrase = os.environ.get("COINBASE_API_PASSPHRASE", "")
+    if not (key and secret and passphrase):
+        return {}
+    timestamp = str(int(time.time()))
+    message = timestamp + "GET" + "/users/self/verify"
+    signature = base64.b64encode(
+        hmac.new(base64.b64decode(secret), message.encode(), hashlib.sha256).digest()
+    ).decode()
+    return {
+        "key": key,
+        "signature": signature,
+        "timestamp": timestamp,
+        "passphrase": passphrase,
+    }
+
+
 async def ws_coinbase_stream(buffer, health, stop_event):
-    """Connect to Coinbase websocket for BTC-USD quotes, trades, and L2 book."""
+    """Connect to Coinbase websocket for BTC-USD quotes, trades, and L2 book.
+
+    L2 orderbook requires authentication (API keys via env vars).
+    Without keys, only ticker and matches channels are subscribed.
+    """
+    auth = _coinbase_auth_headers()
+    channels = ["ticker", "matches"]
+    if auth:
+        channels.append("level2")
+        print("[coinbase] L2 auth configured — subscribing to level2")
+    else:
+        print("[coinbase] no API keys — skipping level2 (set COINBASE_API_KEY/SECRET/PASSPHRASE)")
+
     sub_msg = json.dumps({
         "type": "subscribe",
         "product_ids": ["BTC-USD"],
-        "channels": ["ticker", "matches", "level2"],
+        "channels": channels,
+        **auth,
     })
 
     while not stop_event.is_set():
