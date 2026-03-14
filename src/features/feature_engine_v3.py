@@ -334,16 +334,20 @@ def build_ref_price(day):
     if bad.any():
         prices[bad] = day.mp_mark[bad]
 
+    # Round mark_price timestamps to nearest second before grid assignment.
+    # Binance markPrice@1s has jitter of 0-9ms (e.g. 300003ms instead of
+    # 300000ms). Without rounding, a price at 300003ms would be assigned to
+    # grid point 301000 instead of 300000, causing the open_ref to be the
+    # price from 1 second earlier.
+    mp_ts_rounded = ((day.mp_ts + 500) // 1000) * 1000
+
     # Build 1-second grid from first to last mark_price timestamp
-    first_ms = int(day.mp_ts[0])
-    last_ms  = int(day.mp_ts[-1])
-    # Align to 1-second boundaries
-    first_s = (first_ms // 1000) * 1000
-    last_s  = (last_ms // 1000) * 1000
+    first_s = int(mp_ts_rounded[0])
+    last_s  = int(mp_ts_rounded[-1])
 
     grid_ts = np.arange(first_s, last_s + 1000, 1000, dtype=np.int64)
-    # Vectorized forward-fill: for each grid point, use last index_price <= that time
-    indices = np.searchsorted(day.mp_ts, grid_ts, side='right') - 1
+    # Vectorized forward-fill: for each grid point, use last price <= that time
+    indices = np.searchsorted(mp_ts_rounded, grid_ts, side='right') - 1
     valid = indices >= 0
     grid_price = np.full(len(grid_ts), np.nan, dtype=np.float64)
     grid_price[valid] = prices[indices[valid]]

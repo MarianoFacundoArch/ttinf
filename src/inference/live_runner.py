@@ -547,10 +547,7 @@ async def ws_coinbase_stream(buffer, health, stop_event):
 
 async def ws_bybit_stream(buffer, health, stop_event):
     """Connect to Bybit websocket for BTCUSDT quotes, trades, and orderbook."""
-    sub_msg = json.dumps({
-        "op": "subscribe",
-        "args": ["tickers.BTCUSDT", "publicTrade.BTCUSDT", "orderbook.25.BTCUSDT"],
-    })
+    topics = ["tickers.BTCUSDT", "publicTrade.BTCUSDT", "orderbook.50.BTCUSDT"]
 
     while not stop_event.is_set():
         try:
@@ -558,7 +555,9 @@ async def ws_bybit_stream(buffer, health, stop_event):
                                           ping_interval=20,
                                           ping_timeout=10,
                                           max_size=2**22) as ws:
-                await ws.send(sub_msg)
+                # Subscribe each topic separately (batch sub fails if any topic is invalid)
+                for topic in topics:
+                    await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
                 last_ping = time.time()
                 async for msg in ws:
                     if stop_event.is_set():
