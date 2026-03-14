@@ -903,17 +903,21 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             p_cal = result["p_calibrated"]
             p_bm = result["brownian_prob"]
 
-            # In polymarket mode, show Chainlink price and dist vs strike
+            # In polymarket mode, use Chainlink price only — never Binance
             poly_mode = poly_tracker and poly_tracker.enabled
-            if poly_mode and poly_tracker.chainlink.price > 0 and poly_tracker.chainlink.age < 30:
+            if poly_mode:
+                if poly_tracker.chainlink.price <= 0 or poly_tracker.chainlink.age > 30:
+                    age = poly_tracker.chainlink.age
+                    print(f"\r  [chainlink] No price available (age={age:.0f}s) — "
+                          f"skipping prediction  ", end="", flush=True)
+                    await asyncio.sleep(interval)
+                    continue
                 price = poly_tracker.chainlink.price
                 strike = poly_tracker.price_to_beat
                 dist = (price - strike) / strike * 10_000
-                price_src = "CL"
             else:
                 price = result["price_now"]
                 dist = result["dist_to_open_bps"]
-                price_src = "BN"
 
             if p_cal >= 0.65:
                 signal = "UP  ^^^"
@@ -941,10 +945,9 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
 
             incomplete_tag = f" [INCOMPLETE {incomplete_secs:.0f}s]" if data_incomplete else ""
 
-            price_label = f"BTC({price_src})" if poly_mode else "BTC"
             open_label_short = "vs strike" if poly_mode else "vs open"
             print(f"  {now_str} | {secs:5.0f}s | "
-                  f"{price_label} {price:>10,.2f} | "
+                  f"BTC {price:>10,.2f} | "
                   f"{open_label_short}: {dist:>+7.2f} bps | "
                   f"P(Up): {p_cal:.3f} | "
                   f"acc: {acc_bucket:.1%} | "
