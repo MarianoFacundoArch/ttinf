@@ -206,6 +206,27 @@ SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
 BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
 
+
+# ---------------------------------------------------------------------------
+# Rate-limited error logging (avoids spamming console)
+# ---------------------------------------------------------------------------
+
+_ws_error_counts = {}   # key -> total count
+_ws_error_last_log = {} # key -> time.time() of last log
+
+
+def _log_ws_error(source, stream, error, raw_keys=None):
+    """Log a websocket parse error, rate-limited to 1 per 60s per source/stream."""
+    key = f"{source}/{stream}"
+    _ws_error_counts[key] = _ws_error_counts.get(key, 0) + 1
+    now = time.time()
+    last = _ws_error_last_log.get(key, 0)
+    if now - last >= 60:
+        _ws_error_last_log[key] = now
+        count = _ws_error_counts[key]
+        extra = f" | keys={raw_keys}" if raw_keys else ""
+        print(f"\n[WS ERROR] {key}: {error} (count={count}){extra}")
+
 # Accuracy and ECE per 5-second bucket (from walk-forward 8 folds)
 # Key: (lo, hi) in seconds_to_expiry → (accuracy, ece)
 BUCKET_STATS = {}
@@ -597,8 +618,8 @@ async def ws_futures_stream(buffer, health, stop_event):
                                 o["S"] == "BUY",
                                 float(o["q"]),
                             )
-                    except (KeyError, ValueError):
-                        pass
+                    except (KeyError, ValueError) as e:
+                        _log_ws_error("futures", stream, e, list(d.keys()) if isinstance(d, dict) else None)
         except Exception as e:
             if not stop_event.is_set():
                 print(f"\n[futures ws] reconnecting: {e}")
@@ -648,8 +669,8 @@ async def ws_spot_stream(buffer, health, stop_event):
                             while len(bp) < 20: bp.append(0.0); bq.append(0.0)
                             while len(ap) < 20: ap.append(0.0); aq.append(0.0)
                             buffer.add_orderbook_spot(ts, bp, bq, ap, aq)
-                    except (KeyError, ValueError):
-                        pass
+                    except (KeyError, ValueError) as e:
+                        _log_ws_error("spot", stream, e, list(d.keys()) if isinstance(d, dict) else None)
         except Exception as e:
             if not stop_event.is_set():
                 print(f"\n[spot ws] reconnecting: {e}")
@@ -717,8 +738,11 @@ async def ws_coinbase_stream(buffer, health, stop_event):
                             buffer.update_coinbase_book(False, bids, asks, ts)
                             health.update("coinbase")
 
-                    except (KeyError, ValueError):
-                        pass
+                        elif msg_type == "error":
+                            print(f"\n[coinbase] subscription error: {d.get('message', '?')} — {d.get('reason', '?')}")
+
+                    except (KeyError, ValueError) as e:
+                        _log_ws_error("coinbase", msg_type, e)
         except Exception as e:
             if not stop_event.is_set():
                 print(f"\n[coinbase ws] reconnecting: {e}")
@@ -779,8 +803,8 @@ async def ws_bybit_stream(buffer, health, stop_event):
                             buffer.update_bybit_book(is_snap, bids, asks, ts)
                             health.update("bybit")
 
-                    except (KeyError, ValueError):
-                        pass
+                    except (KeyError, ValueError) as e:
+                        _log_ws_error("bybit", topic, e)
         except Exception as e:
             if not stop_event.is_set():
                 print(f"\n[bybit ws] reconnecting: {e}")
@@ -822,8 +846,8 @@ async def metrics_poller(buffer, session, stop_event):
             if ts not in buffer.mt_ts:
                 buffer.add_metrics(ts, ls, top_ls, taker_ls, oi)
 
-        except Exception:
-            pass
+        except Exception as e:
+            _log_ws_error("rest", "metrics_poller", e)
 
         await asyncio.sleep(60)
 
