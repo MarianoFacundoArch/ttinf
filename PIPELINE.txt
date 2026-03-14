@@ -1,0 +1,25 @@
+# Pipeline completo: descargar, generar dataset, Optuna, entrenar
+# Correr en el server (ubuntu@54.224.77.198)
+# Ajustar fechas según corresponda
+
+# 0. Pull últimos cambios
+git pull
+
+# 1. Descargar datos (ajustar --end al día de hoy, es exclusivo)
+python -m src.data.download_all --start 2025-11-11 --end 2026-03-14 --workers 6
+
+# 2. Borrar dataset viejo y regenerar (--end exclusivo)
+rm -rf data/dataset_v3/*.parquet
+python -m src.training.build_dataset_v3 --start 2025-11-11 --end 2026-03-14 --workers 8
+
+# 3. Optuna (buscar mejores hiperparámetros)
+python -m src.training.tune_hyperparams --n-trials 200 --timeout 28800
+
+# 4. Entrenar modelo final con walk-forward
+python -m src.training.train_model_v3 --dataset-dir data/dataset_v3 --output-dir models --walkforward
+
+# 5. Copiar modelo a local (desde tu mac)
+# scp ubuntu@54.224.77.198:~/predictxgboost/models/lightgbm_v3.txt models/
+# scp ubuntu@54.224.77.198:~/predictxgboost/models/calibrators_v3.pkl models/
+# scp ubuntu@54.224.77.198:~/predictxgboost/models/feature_columns_v3.txt models/
+# scp ubuntu@54.224.77.198:~/predictxgboost/models/model_config_v3.json models/

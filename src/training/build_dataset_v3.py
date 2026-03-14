@@ -173,24 +173,54 @@ def _merge_day_data(main_day, extra_day, prepend=True):
     return main_day
 
 
-def _load_day_safe(date_str, data_dir):
+def _load_day_safe(date_str, data_dir, time_range=None):
     """Load day data, return None if directory doesn't exist."""
     d = Path(data_dir) / date_str
     if not d.exists():
         return None
     try:
-        return load_day_data(date_str, data_dir=data_dir)
+        return load_day_data(date_str, data_dir=data_dir, time_range=time_range)
     except Exception:
         return None
+
+
+def _load_windowed(date_strs, data_dir, window_start_ms, window_end_ms):
+    """Load and merge data from multiple dates, filtered to a time window.
+
+    Tries each date in date_strs; merges all that have data within the window.
+    """
+    data_dir = Path(data_dir) if data_dir else DATA_DIR
+    merged = None
+    for ds in date_strs:
+        day = _load_day_safe(ds, data_dir, time_range=(window_start_ms, window_end_ms))
+        if day is None:
+            continue
+        # Skip if no data in window (e.g. all timestamps filtered out)
+        if len(day.tf_ts) == 0 and len(day.bf_ts) == 0:
+            continue
+        if merged is None:
+            merged = day
+        else:
+            merged = _merge_day_data(merged, day, prepend=False)
+    return merged
 
 
 # ---------------------------------------------------------------------------
 # Process a single day
 # ---------------------------------------------------------------------------
 
+CHUNK_SIZE_BLOCKS = 24  # Process 24 blocks (2 hours) at a time
+LOOKBACK_MS = 300_000   # Max feature lookback: 5 minutes
+
+
 def process_day(date_str, data_dir=None, output_dir=None):
     """
-    Process one day: compute features + target for every 5s within each block.
+    Process one day: compute features + target for every 1s within each block.
+
+    Uses chunked loading: only keeps ~10-35 min of market data in RAM at a
+    time instead of the full 24h. This reduces per-worker memory from ~2 GB
+    to ~200 MB, allowing 8+ parallel workers.
+
     Returns (date_str, n_rows, n_blocks, n_skipped, elapsed_sec, status).
     """
     data_dir   = Path(data_dir)   if data_dir   else DATA_DIR
@@ -208,34 +238,45 @@ def process_day(date_str, data_dir=None, output_dir=None):
     day_start_ms = int(dt.timestamp() * 1000)
     day_end_ms   = day_start_ms + 86_400_000
 
-    # Load main day
-    day = load_day_data(date_str, data_dir=data_dir)
-
-    # Load previous day (last 30 min) for border blocks
+    # --- Step 1: Build ref_price + keep lightweight data ---
+    # Load full day + borders to build ref_price and keep metrics/liquidations
+    # (these are tiny: metrics ~288 rows, liquidations ~few hundred).
+    day_full = load_day_data(date_str, data_dir=data_dir)
     prev_date = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
     prev_day = _load_day_safe(prev_date, data_dir)
     if prev_day is not None:
-        # Filter to last 30 min of previous day
-        cutoff = day_start_ms - 1_800_000  # 30 min before midnight
+        cutoff = day_start_ms - 1_800_000
         _filter_day_after(prev_day, cutoff)
-        day = _merge_day_data(day, prev_day, prepend=True)
-
-    # Load next day (first 5 min) for close_ref of last block
+        day_full = _merge_day_data(day_full, prev_day, prepend=True)
     next_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
     next_day = _load_day_safe(next_date, data_dir)
     if next_day is not None:
-        # Filter to first 5 min of next day
         cutoff = day_end_ms + 300_000
         _filter_day_before(next_day, cutoff)
-        day = _merge_day_data(day, next_day, prepend=False)
+        day_full = _merge_day_data(day_full, next_day, prepend=False)
+    ref = build_ref_price(day_full)
 
-    # Build ref_price from merged data
-    ref = build_ref_price(day)
+    # Keep lightweight arrays that features need for the full day
+    # (metrics, liquidations, mark_price — all tiny)
+    _kept_mt_ts       = day_full.mt_ts
+    _kept_mt_ls_ratio = day_full.mt_ls_ratio
+    _kept_mt_top_ls   = day_full.mt_top_ls
+    _kept_mt_taker_ls = day_full.mt_taker_ls
+    _kept_mt_oi       = day_full.mt_oi
+    _kept_lq_ts       = day_full.lq_ts
+    _kept_lq_is_buy   = day_full.lq_is_buy
+    _kept_lq_qty      = day_full.lq_qty
+    _kept_mp_ts       = day_full.mp_ts
+    _kept_mp_mark     = day_full.mp_mark
+    _kept_mp_index    = day_full.mp_index
+    _kept_mp_funding  = day_full.mp_funding
+    _kept_mp_next_ms  = day_full.mp_next_ms
+    del day_full, prev_day, next_day
 
     if len(ref['ts']) == 0:
         return (date_str, 0, 0, 0, time.time() - t0, "ERROR: no ref_price data")
 
-    # Enumerate blocks for this day
+    # --- Step 2: Enumerate blocks ---
     first_block = (day_start_ms // BLOCK_DURATION_MS) * BLOCK_DURATION_MS
     if first_block < day_start_ms:
         first_block += BLOCK_DURATION_MS
@@ -254,77 +295,104 @@ def process_day(date_str, data_dir=None, output_dir=None):
     row = 0
     n_blocks_ok = 0
     n_skipped_blocks = 0
+    block_results_history = []
 
-    # Track block results for history features
-    block_results_history = []  # list of dicts, most recent first
+    # --- Step 3: Process blocks in chunks ---
+    # Each chunk loads only the time window it needs from disk.
+    # Adjacent dates are included in the window when needed (border chunks).
+    all_dates = [prev_date, date_str, next_date]
 
-    for block_idx, block_start_ms in enumerate(blocks):
-        block_end_ms = block_start_ms + BLOCK_DURATION_MS
+    for chunk_start_idx in range(0, len(blocks), CHUNK_SIZE_BLOCKS):
+        chunk_blocks = blocks[chunk_start_idx:chunk_start_idx + CHUNK_SIZE_BLOCKS]
 
-        # open_ref: last ref_price <= block_start
-        open_idx = _last_before(ref['ts'], block_start_ms)
-        if open_idx < 0 or np.isnan(ref['price'][open_idx]):
-            n_skipped_blocks += 1
-            continue
-        open_ref = ref['price'][open_idx]
-        open_ref_age_ms = block_start_ms - ref['ts'][open_idx]
+        # Time window this chunk needs: lookback before first block to end of last block
+        window_start = chunk_blocks[0] - LOOKBACK_MS
+        window_end = chunk_blocks[-1] + BLOCK_DURATION_MS
 
-        # close_ref: last ref_price <= block_end
-        close_idx = _last_before(ref['ts'], block_end_ms)
-        if close_idx < 0 or np.isnan(ref['price'][close_idx]):
-            n_skipped_blocks += 1
-            continue
-        close_ref = ref['price'][close_idx]
+        # Load data for this window (may span prev/next day)
+        day = _load_windowed(all_dates, data_dir, window_start, window_end)
 
-        # Target
-        target = 1 if close_ref >= open_ref else 0
-        terminal_return_bps = _safe_div(close_ref - open_ref, open_ref) * 10_000
+        # Inject full-day lightweight data (metrics, liquidations, mark_price)
+        # These are tiny and must be consistent across all chunks.
+        if day is not None:
+            day.mt_ts       = _kept_mt_ts
+            day.mt_ls_ratio = _kept_mt_ls_ratio
+            day.mt_top_ls   = _kept_mt_top_ls
+            day.mt_taker_ls = _kept_mt_taker_ls
+            day.mt_oi       = _kept_mt_oi
+            day.lq_ts       = _kept_lq_ts
+            day.lq_is_buy   = _kept_lq_is_buy
+            day.lq_qty      = _kept_lq_qty
+            day.mp_ts       = _kept_mp_ts
+            day.mp_mark     = _kept_mp_mark
+            day.mp_index    = _kept_mp_index
+            day.mp_funding  = _kept_mp_funding
+            day.mp_next_ms  = _kept_mp_next_ms
 
-        # Generate rows every 5s within block
-        n_blocks_ok += 1
-        block_cache = {}  # Cache static features within this block
-        for sample_offset_ms in range(0, BLOCK_DURATION_MS, SAMPLE_INTERVAL_MS):
-            T_ms = block_start_ms + sample_offset_ms
+        for block_idx_in_chunk, block_start_ms in enumerate(chunk_blocks):
+            block_idx = chunk_start_idx + block_idx_in_chunk
+            block_end_ms = block_start_ms + BLOCK_DURATION_MS
 
-            # Skip if T_ms is outside the day we're processing
-            # (we only want rows for THIS day, not overlap days)
-            if T_ms < day_start_ms or T_ms >= day_end_ms:
+            # open_ref: last ref_price <= block_start
+            open_idx = _last_before(ref['ts'], block_start_ms)
+            if open_idx < 0 or np.isnan(ref['price'][open_idx]):
+                n_skipped_blocks += 1
                 continue
+            open_ref = ref['price'][open_idx]
+            open_ref_age_ms = block_start_ms - ref['ts'][open_idx]
 
-            # Compute features
-            feats = compute_features_v3(
-                day, ref, T_ms, block_start_ms, open_ref,
-                open_ref_age_ms=open_ref_age_ms,
-                block_results=block_results_history,
-                block_cache=block_cache,
-            )
+            # close_ref: last ref_price <= block_end
+            close_idx = _last_before(ref['ts'], block_end_ms)
+            if close_idx < 0 or np.isnan(ref['price'][close_idx]):
+                n_skipped_blocks += 1
+                continue
+            close_ref = ref['price'][close_idx]
 
-            # Store row
-            data[row, 0] = block_start_ms
-            data[row, 1] = T_ms
-            data[row, 2] = target
-            data[row, 3] = terminal_return_bps
-            for ci, col in enumerate(FEATURE_COLUMNS_V3):
-                data[row, 4 + ci] = feats.get(col, np.nan)
-            row += 1
+            # Target
+            target = 1 if close_ref >= open_ref else 0
+            terminal_return_bps = _safe_div(close_ref - open_ref, open_ref) * 10_000
 
-        # Add this block's result to history (most recent first)
-        block_results_history.insert(0, {
-            'return_bps': terminal_return_bps,
-            'result': target,
-        })
-        # Keep only last 6
-        if len(block_results_history) > 6:
-            block_results_history = block_results_history[:6]
+            # Generate rows every 1s within block
+            n_blocks_ok += 1
+            block_cache = {}
+            for sample_offset_ms in range(0, BLOCK_DURATION_MS, SAMPLE_INTERVAL_MS):
+                T_ms = block_start_ms + sample_offset_ms
 
-        # Progress
-        if (block_idx + 1) % 50 == 0:
-            elapsed = time.time() - t0
-            pct = (block_idx + 1) / len(blocks) * 100
-            rate = row / elapsed if elapsed > 0 else 0
-            eta = (max_rows - row) / rate if rate > 0 else 0
-            print(f"  {date_str}: block {block_idx+1}/{len(blocks)} ({pct:.0f}%), "
-                  f"{row:,} rows [{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]")
+                if T_ms < day_start_ms or T_ms >= day_end_ms:
+                    continue
+
+                feats = compute_features_v3(
+                    day, ref, T_ms, block_start_ms, open_ref,
+                    open_ref_age_ms=open_ref_age_ms,
+                    block_results=block_results_history,
+                    block_cache=block_cache,
+                )
+
+                data[row, 0] = block_start_ms
+                data[row, 1] = T_ms
+                data[row, 2] = target
+                data[row, 3] = terminal_return_bps
+                for ci, col in enumerate(FEATURE_COLUMNS_V3):
+                    data[row, 4 + ci] = feats.get(col, np.nan)
+                row += 1
+
+            block_results_history.insert(0, {
+                'return_bps': terminal_return_bps,
+                'result': target,
+            })
+            if len(block_results_history) > 6:
+                block_results_history = block_results_history[:6]
+
+            # Progress
+            if (block_idx + 1) % 50 == 0:
+                elapsed = time.time() - t0
+                pct = (block_idx + 1) / len(blocks) * 100
+                rate = row / elapsed if elapsed > 0 else 0
+                eta = (max_rows - row) / rate if rate > 0 else 0
+                print(f"  {date_str}: block {block_idx+1}/{len(blocks)} ({pct:.0f}%), "
+                      f"{row:,} rows [{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]")
+
+        del day  # Free chunk data
 
     # Trim and save
     data = data[:row]

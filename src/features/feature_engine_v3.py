@@ -111,14 +111,28 @@ def _precompute_book(ts, bid_prices, bid_qtys, ask_prices, ask_qtys):
 # Load day data
 # ---------------------------------------------------------------------------
 
-def load_day_data(date_str, data_dir=None):
-    """Load all parquet streams for a day into a DayData object."""
+def load_day_data(date_str, data_dir=None, time_range=None):
+    """Load all parquet streams for a day into a DayData object.
+
+    Args:
+        time_range: optional (start_ms, end_ms) tuple. Only keeps rows
+                    within [start_ms, end_ms). Reduces RAM when only a
+                    time window is needed (e.g. chunked dataset building).
+    """
     base = Path(data_dir) if data_dir else DATA_DIR
     d = base / date_str
     day = DayData()
 
+    def _read(path, ts_col="timestamp_ms"):
+        """Read parquet, optionally filter by time_range."""
+        df = pq.read_table(path).to_pandas()
+        if time_range is not None and ts_col in df.columns:
+            mask = (df[ts_col].values >= time_range[0]) & (df[ts_col].values < time_range[1])
+            df = df.loc[mask]
+        return df
+
     # --- Trades futures ---
-    df = pq.read_table(d / "trades_futures" / "full_day.parquet").to_pandas()
+    df = _read(d / "trades_futures" / "full_day.parquet")
     day.tf_ts    = df["timestamp_ms"].values.astype(np.int64)
     day.tf_price = df["price"].values.astype(np.float64)
     day.tf_qty   = df["qty"].values.astype(np.float64)
@@ -126,7 +140,7 @@ def load_day_data(date_str, data_dir=None):
     del df
 
     # --- Trades spot ---
-    df = pq.read_table(d / "trades_spot" / "full_day.parquet").to_pandas()
+    df = _read(d / "trades_spot" / "full_day.parquet")
     day.ts_ts    = df["timestamp_ms"].values.astype(np.int64)
     day.ts_price = df["price"].values.astype(np.float64)
     day.ts_qty   = df["qty"].values.astype(np.float64)
@@ -134,7 +148,7 @@ def load_day_data(date_str, data_dir=None):
     del df
 
     # --- Bookticker futures ---
-    df = pq.read_table(d / "bookticker_futures" / "full_day.parquet").to_pandas()
+    df = _read(d / "bookticker_futures" / "full_day.parquet")
     day.bf_ts  = df["timestamp_ms"].values.astype(np.int64)
     day.bf_bid = df["best_bid_price"].values.astype(np.float64)
     day.bf_ask = df["best_ask_price"].values.astype(np.float64)
@@ -142,7 +156,7 @@ def load_day_data(date_str, data_dir=None):
     del df
 
     # --- Bookticker spot ---
-    df = pq.read_table(d / "bookticker_spot" / "full_day.parquet").to_pandas()
+    df = _read(d / "bookticker_spot" / "full_day.parquet")
     day.bs_ts  = df["timestamp_ms"].values.astype(np.int64)
     day.bs_bid = df["best_bid_price"].values.astype(np.float64)
     day.bs_ask = df["best_ask_price"].values.astype(np.float64)
@@ -150,7 +164,7 @@ def load_day_data(date_str, data_dir=None):
     del df
 
     # --- Orderbook futures (pre-computed) ---
-    df = pq.read_table(d / "orderbook_futures" / "full_day.parquet").to_pandas()
+    df = _read(d / "orderbook_futures" / "full_day.parquet")
     ts = df["timestamp_ms"].values.astype(np.int64)
     bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
     bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
@@ -160,7 +174,7 @@ def load_day_data(date_str, data_dir=None):
     del df, ts, bp, bq, ap, aq
 
     # --- Orderbook spot (pre-computed) ---
-    df = pq.read_table(d / "orderbook_spot" / "full_day.parquet").to_pandas()
+    df = _read(d / "orderbook_spot" / "full_day.parquet")
     ts = df["timestamp_ms"].values.astype(np.int64)
     bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
     bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
@@ -170,7 +184,7 @@ def load_day_data(date_str, data_dir=None):
     del df, ts, bp, bq, ap, aq
 
     # --- Mark price ---
-    df = pq.read_table(d / "mark_price" / "full_day.parquet").to_pandas()
+    df = _read(d / "mark_price" / "full_day.parquet")
     day.mp_ts      = df["timestamp_ms"].values.astype(np.int64)
     day.mp_mark    = df["mark_price"].values.astype(np.float64)
     day.mp_index   = df["index_price"].values.astype(np.float64)
@@ -181,7 +195,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Liquidations ---
     path = d / "liquidations" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         day.lq_ts     = df["timestamp_ms"].values.astype(np.int64)
         day.lq_is_buy = (df["side"].values.astype(str) == "buy")
         day.lq_qty    = df["qty"].values.astype(np.float64)
@@ -194,7 +208,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Metrics (5-min intervals) ---
     path = d / "metrics" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         day.mt_ts       = (pd.to_datetime(df["create_time"])
                            .astype(np.int64) // 1_000_000).values
         day.mt_ls_ratio = df["count_long_short_ratio"].values.astype(np.float64)
@@ -216,7 +230,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Cross-exchange: Coinbase quotes ---
     path = d / "coinbase_quotes" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         day.cb_ts  = df["timestamp_ms"].values.astype(np.int64)
         day.cb_bid = df["best_bid_price"].values.astype(np.float64)
         day.cb_ask = df["best_ask_price"].values.astype(np.float64)
@@ -231,7 +245,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Cross-exchange: Bybit quotes ---
     path = d / "bybit_quotes" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         day.bb_ts  = df["timestamp_ms"].values.astype(np.int64)
         day.bb_bid = df["best_bid_price"].values.astype(np.float64)
         day.bb_ask = df["best_ask_price"].values.astype(np.float64)
@@ -246,7 +260,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Cross-exchange: Coinbase trades ---
     path = d / "coinbase_trades" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         day.ct_ts    = df["timestamp_ms"].values.astype(np.int64)
         day.ct_price = df["price"].values.astype(np.float64)
         day.ct_qty   = df["qty"].values.astype(np.float64)
@@ -261,7 +275,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Cross-exchange: Bybit trades ---
     path = d / "bybit_trades" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         day.bt_ts    = df["timestamp_ms"].values.astype(np.int64)
         day.bt_price = df["price"].values.astype(np.float64)
         day.bt_qty   = df["qty"].values.astype(np.float64)
@@ -276,7 +290,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Cross-exchange: Coinbase orderbook (from incremental L2) ---
     path = d / "coinbase_book_l2" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         ts = df["timestamp_ms"].values.astype(np.int64)
         bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
         bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
@@ -294,7 +308,7 @@ def load_day_data(date_str, data_dir=None):
     # --- Cross-exchange: Bybit orderbook ---
     path = d / "bybit_orderbook" / "full_day.parquet"
     if path.exists():
-        df = pq.read_table(path).to_pandas()
+        df = _read(path)
         ts = df["timestamp_ms"].values.astype(np.int64)
         bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
         bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
