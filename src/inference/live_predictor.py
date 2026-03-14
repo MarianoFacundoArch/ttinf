@@ -115,13 +115,15 @@ class LivePredictor:
 
         return True
 
-    def predict(self, buffer, now_ms=None):
+    def predict(self, buffer, now_ms=None, open_ref_override=None):
         """
         Compute features and predict P(Up) for the current moment.
 
         Args:
             buffer: LiveBuffer instance
             now_ms: current timestamp in ms (default: now)
+            open_ref_override: if set, use this as open_ref instead of
+                               the Binance-derived one (e.g. Polymarket strike)
 
         Returns:
             dict with prediction info, or None if not enough data
@@ -141,6 +143,11 @@ class LivePredictor:
 
         # Update block (sets open_ref, closes previous)
         self.update_block(now_ms, ref)
+
+        # Override open_ref with external price (e.g. Polymarket)
+        if open_ref_override is not None:
+            self.open_ref = open_ref_override
+            self.open_ref_age_ms = 0
 
         if self.open_ref <= 0:
             return None

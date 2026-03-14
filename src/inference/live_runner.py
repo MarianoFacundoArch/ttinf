@@ -25,6 +25,99 @@ import numpy as np
 from src.inference.live_buffer import LiveBuffer
 from src.inference.live_predictor import LivePredictor
 
+
+# ---------------------------------------------------------------------------
+# Polymarket integration
+# ---------------------------------------------------------------------------
+
+POLYMARKET_CRYPTO_API = "https://polymarket.com/api/crypto/crypto-price"
+
+
+class PolymarketTracker:
+    """Track Polymarket 5-min markets and poll for price_to_beat."""
+
+    def __init__(self, asset="BTC", timeframe="5m"):
+        self.asset = asset
+        self.timeframe = timeframe
+        self.interval_sec = 900 if timeframe == "15m" else 300
+        self.variant = "fifteenminute" if timeframe == "15m" else "fiveminute"
+
+        self.current_open_ts = 0      # Unix seconds of current block open
+        self.price_to_beat = None     # Strike price from Polymarket
+        self._polling = False         # True while polling for price
+        self.enabled = False          # Set to True to activate
+
+    def get_block_open_ts(self, now_sec=None):
+        """Get the current block's open timestamp in seconds."""
+        if now_sec is None:
+            now_sec = int(time.time())
+        return (now_sec // self.interval_sec) * self.interval_sec
+
+    def check_new_block(self):
+        """Check if we entered a new block. Returns True if block changed."""
+        block_ts = self.get_block_open_ts()
+        if block_ts != self.current_open_ts:
+            self.current_open_ts = block_ts
+            self.price_to_beat = None
+            self._polling = True
+            return True
+        return False
+
+    def get_api_url(self):
+        """Build the Polymarket crypto-price API URL for current block."""
+        open_dt = datetime.fromtimestamp(self.current_open_ts, tz=timezone.utc)
+        close_dt = datetime.fromtimestamp(
+            self.current_open_ts + self.interval_sec, tz=timezone.utc
+        )
+        open_iso = open_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        close_iso = close_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return (
+            f"{POLYMARKET_CRYPTO_API}?symbol={self.asset}"
+            f"&eventStartTime={open_iso}"
+            f"&variant={self.variant}"
+            f"&endDate={close_iso}"
+        )
+
+
+async def polymarket_poller(tracker, session, stop_event):
+    """Poll Polymarket API for price_to_beat when a new block starts."""
+    if not tracker.enabled:
+        return
+
+    while not stop_event.is_set():
+        try:
+            # Check for new block
+            tracker.check_new_block()
+
+            # Poll if we need the price
+            if tracker._polling and tracker.price_to_beat is None:
+                url = tracker.get_api_url()
+                try:
+                    async with session.get(url, ssl=SSL_CONTEXT, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            open_price = data.get("openPrice")
+                            if open_price and float(open_price) > 0:
+                                tracker.price_to_beat = float(open_price)
+                                tracker._polling = False
+                                block_time = datetime.fromtimestamp(
+                                    tracker.current_open_ts, tz=timezone.utc
+                                ).strftime("%H:%M")
+                                print(f"\n  [polymarket] Block {block_time}: "
+                                      f"price_to_beat = ${tracker.price_to_beat:,.2f}")
+                except Exception:
+                    pass  # Silent retry
+
+                # Poll every 500ms until found
+                await asyncio.sleep(0.5)
+            else:
+                # No need to poll — check every 1s for new blocks
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            print(f"\n  [polymarket] error: {e}")
+            await asyncio.sleep(2)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -653,13 +746,14 @@ async def metrics_poller(buffer, session, stop_event):
 # ---------------------------------------------------------------------------
 
 async def prediction_loop(buffer, predictor, interval, stop_event,
-                          health=None, ws_clients=None):
+                          health=None, ws_clients=None, poly_tracker=None):
     """Run prediction every `interval` seconds."""
     await asyncio.sleep(3)
 
     last_block = 0
     block_count = 0
     last_health_log = 0
+    last_no_market_log = 0
 
     while not stop_event.is_set():
         try:
@@ -678,13 +772,27 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 print(f"\n  [health] {health.status_line()}")
                 last_health_log = time.time()
 
+            # Polymarket mode: wait for price_to_beat
+            if poly_tracker and poly_tracker.enabled:
+                if poly_tracker.price_to_beat is None:
+                    if time.time() - last_no_market_log > 5:
+                        secs_into = int(time.time()) - poly_tracker.current_open_ts
+                        print(f"\r  [polymarket] Waiting for price_to_beat... "
+                              f"({secs_into}s into block)  ", end="", flush=True)
+                        last_no_market_log = time.time()
+                    await asyncio.sleep(interval)
+                    continue
+
             # Trim old data
             buffer.trim(now_ms)
 
             # Predict (in thread to not block event loop / ws pings)
+            open_ref_override = (poly_tracker.price_to_beat
+                                 if poly_tracker and poly_tracker.enabled
+                                 else None)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
-                None, predictor.predict, buffer, now_ms
+                None, predictor.predict, buffer, now_ms, open_ref_override
             )
 
             if result is None:
@@ -702,9 +810,12 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 block_end = datetime.fromtimestamp(
                     (last_block + 300_000) / 1000, tz=timezone.utc
                 ).strftime("%H:%M")
+                open_label = "Open"
+                if poly_tracker and poly_tracker.enabled:
+                    open_label = "Strike (Polymarket)"
                 print(f"\n{'='*80}")
                 print(f"  NEW BLOCK: {block_time}-{block_end} UTC  |  "
-                      f"Open: {result['open_ref']:,.2f}  |  "
+                      f"{open_label}: {result['open_ref']:,.2f}  |  "
                       f"Blocks seen: {block_count}")
                 print(f"{'='*80}")
 
@@ -757,7 +868,7 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
 
             # Broadcast to websocket clients
             if ws_clients:
-                payload = json.dumps({
+                ws_data = {
                     "block_start_ms": result["block_start_ms"],
                     "now_ms": now_ms,
                     "seconds_to_expiry": round(secs, 1),
@@ -776,7 +887,11 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     "warming_up": warming,
                     "data_incomplete": data_incomplete,
                     "data_complete_in_s": round(incomplete_secs, 0) if data_incomplete else 0,
-                })
+                }
+                if poly_tracker and poly_tracker.enabled:
+                    ws_data["polymarket_mode"] = True
+                    ws_data["price_to_beat"] = poly_tracker.price_to_beat
+                payload = json.dumps(ws_data)
                 dead = set()
                 for client in ws_clients:
                     try:
@@ -807,10 +922,12 @@ async def ws_server_handler(websocket, ws_clients):
         print(f"\n  [ws-server] client disconnected: {addr}")
 
 
-async def main(interval=1, ws_port=8765):
+async def main(interval=1, ws_port=8765, use_polymarket=False):
     buffer = LiveBuffer(max_seconds=600)
     predictor = LivePredictor()
     health = WSHealth()
+    poly_tracker = PolymarketTracker()
+    poly_tracker.enabled = use_polymarket
 
     # Websocket clients set (shared with prediction_loop)
     ws_clients = set()
@@ -823,6 +940,8 @@ async def main(interval=1, ws_port=8765):
     print(f"  Interval: {interval}s")
     print(f"  WS server: ws://localhost:{ws_port}")
     print(f"  Feeds: Binance(futures+spot) + Coinbase + Bybit")
+    if use_polymarket:
+        print(f"  Polymarket: ENABLED (open_ref from Polymarket strike)")
     print()
 
     async with aiohttp.ClientSession() as session:
@@ -844,8 +963,9 @@ async def main(interval=1, ws_port=8765):
                 ws_coinbase_stream(buffer, health, stop_event),
                 ws_bybit_stream(buffer, health, stop_event),
                 metrics_poller(buffer, session, stop_event),
+                polymarket_poller(poly_tracker, session, stop_event),
                 prediction_loop(buffer, predictor, interval, stop_event,
-                                health, ws_clients),
+                                health, ws_clients, poly_tracker),
             )
         except KeyboardInterrupt:
             print("\n\nStopping...")
@@ -861,9 +981,13 @@ if __name__ == "__main__":
                         help="Prediction interval in seconds (default: 1)")
     parser.add_argument("--ws-port", type=int, default=8765,
                         help="WebSocket server port (default: 8765)")
+    parser.add_argument("--polymarket", action="store_true",
+                        help="Use Polymarket strike as open_ref (skip prediction "
+                             "until price_to_beat is available)")
     args = parser.parse_args()
 
     try:
-        asyncio.run(main(interval=args.interval, ws_port=args.ws_port))
+        asyncio.run(main(interval=args.interval, ws_port=args.ws_port,
+                         use_polymarket=args.polymarket))
     except KeyboardInterrupt:
         print("\nDone.")
