@@ -35,7 +35,7 @@ POLYMARKET_LIVE_WS = "wss://ws-live-data.polymarket.com/"
 
 
 class ChainlinkPriceFeed:
-    """Real-time Chainlink BTC/USD price from Polymarket websocket."""
+    """Real-time BTC/USD price from Polymarket RTDS websocket."""
 
     def __init__(self):
         self.price = 0.0
@@ -135,8 +135,8 @@ async def polymarket_poller(tracker, session, stop_event):
             await asyncio.sleep(2)
 
 
-async def ws_chainlink_stream(tracker, stop_event):
-    """Connect to Polymarket live-data WS for Chainlink BTC/USD price."""
+async def ws_polymarket_price_stream(tracker, stop_event):
+    """Connect to Polymarket RTDS for real-time Chainlink BTC/USD price."""
     if not tracker.enabled:
         return
 
@@ -145,17 +145,17 @@ async def ws_chainlink_stream(tracker, stop_event):
         "subscriptions": [{
             "topic": "crypto_prices_chainlink",
             "type": "update",
-            "filters": json.dumps({"symbol": "btc/usd"}),
+            "filters": json.dumps({"symbol": "btc/usd"}, separators=(",", ":")),
         }],
     })
 
     while not stop_event.is_set():
         try:
             async with websockets.connect(POLYMARKET_LIVE_WS, ssl=SSL_CONTEXT,
-                                          ping_interval=30,
+                                          ping_interval=5,
                                           ping_timeout=20) as ws:
                 await ws.send(sub_msg)
-                print("  [chainlink] Connected to Polymarket price feed")
+                print("  [polymarket-price] Connected to RTDS (chainlink btc/usd)")
                 async for msg in ws:
                     if stop_event.is_set():
                         break
@@ -168,18 +168,17 @@ async def ws_chainlink_stream(tracker, stop_event):
                         if not payload:
                             continue
 
-                        # Format 1: initial snapshot with data array
+                        # Snapshot: {"payload": {"data": [{timestamp, value}, ...]}}
                         if isinstance(payload, dict) and "data" in payload:
                             data = payload["data"]
                             if isinstance(data, list) and len(data) > 0:
                                 last = data[-1]
                                 tracker.chainlink.price = float(last["value"])
                                 tracker.chainlink.received_at = time.time()
-                                print(f"  [chainlink] Initial: "
-                                      f"${tracker.chainlink.price:,.2f}")
+                                print(f"  [polymarket-price] ${tracker.chainlink.price:,.2f}")
 
-                        # Format 2: individual update with value
-                        elif isinstance(payload, dict) and "value" in payload:
+                        # Update: {topic, type: "update", payload: {value, ...}}
+                        elif d.get("topic") == "crypto_prices_chainlink":
                             tracker.chainlink.price = float(payload["value"])
                             tracker.chainlink.received_at = time.time()
 
@@ -187,7 +186,7 @@ async def ws_chainlink_stream(tracker, stop_event):
                         pass
         except Exception as e:
             if not stop_event.is_set():
-                print(f"\n  [chainlink] reconnecting: {e}")
+                print(f"\n  [polymarket-price] reconnecting: {e}")
                 await asyncio.sleep(5)
 
 
@@ -315,17 +314,32 @@ class WSHealth:
                 worst = remaining
         return max(0.0, worst)
 
-    def status_line(self):
+    def status_line(self, poly_tracker=None):
         parts = []
+        all_ok = True
         for src in ["binance_futures", "binance_spot", "coinbase", "bybit"]:
             age = self.age(src)
             if age == float('inf'):
                 parts.append(f"{src}:OFF")
+                all_ok = False
             elif age > 10:
                 parts.append(f"{src}:STALE({age:.0f}s)")
+                all_ok = False
             else:
                 parts.append(f"{src}:OK")
-        return " | ".join(parts)
+        if poly_tracker and poly_tracker.enabled:
+            cl_age = poly_tracker.chainlink.age
+            if poly_tracker.chainlink.price <= 0 or cl_age > 10:
+                parts.append(f"polymarket_price:OFF")
+                all_ok = False
+            else:
+                parts.append(f"polymarket_price:OK")
+            if poly_tracker.price_to_beat is None:
+                parts.append(f"polymarket_strike:WAITING")
+                all_ok = False
+            else:
+                parts.append(f"polymarket_strike:OK")
+        return " | ".join(parts), all_ok
 
 
 # ---------------------------------------------------------------------------
@@ -835,14 +849,17 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             # Health check: don't predict if Binance futures is down
             if health and not health.binance_ok():
                 age = health.age("binance_futures")
+                status, _ = health.status_line(poly_tracker)
                 print(f"\r  BINANCE DOWN ({age:.0f}s) — skipping prediction | "
-                      f"{health.status_line()}  ", end="", flush=True)
+                      f"{status}  ", end="", flush=True)
                 await asyncio.sleep(interval)
                 continue
 
-            # Periodic health log (every 60s)
+            # Periodic health log (every 60s, only if something is down)
             if health and time.time() - last_health_log > 60:
-                print(f"\n  [health] {health.status_line()}")
+                status, all_ok = health.status_line(poly_tracker)
+                if not all_ok:
+                    print(f"\n  [health] {status}")
                 last_health_log = time.time()
 
             # Polymarket mode: check block transitions and wait for price_to_beat
@@ -858,16 +875,28 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     await asyncio.sleep(interval)
                     continue
 
+            # Polymarket mode: check Chainlink price BEFORE predicting
+            poly_mode = poly_tracker and poly_tracker.enabled
+            if poly_mode:
+                cl_age = poly_tracker.chainlink.age
+                if poly_tracker.chainlink.price <= 0 or cl_age > 10:
+                    print(f"\r  [polymarket] No price (age={cl_age:.0f}s) — "
+                          f"waiting for Chainlink feed  ", end="", flush=True)
+                    await asyncio.sleep(interval)
+                    continue
+
             # Trim old data
             buffer.trim(now_ms)
 
             # Predict (in thread to not block event loop / ws pings)
             open_ref_override = (poly_tracker.price_to_beat
-                                 if poly_tracker and poly_tracker.enabled
-                                 else None)
+                                 if poly_mode else None)
+            current_price_override = (poly_tracker.chainlink.price
+                                      if poly_mode else None)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
-                None, predictor.predict, buffer, now_ms, open_ref_override
+                None, predictor.predict, buffer, now_ms,
+                open_ref_override, current_price_override
             )
 
             if result is None:
@@ -885,9 +914,7 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                 block_end = datetime.fromtimestamp(
                     (last_block + 300_000) / 1000, tz=timezone.utc
                 ).strftime("%H:%M")
-                open_label = "Open"
-                if poly_tracker and poly_tracker.enabled:
-                    open_label = "Strike (Polymarket)"
+                open_label = "Strike (Polymarket)" if poly_mode else "Open"
                 print(f"\n{'='*80}")
                 print(f"  NEW BLOCK: {block_time}-{block_end} UTC  |  "
                       f"{open_label}: {result['open_ref']:,.2f}  |  "
@@ -903,15 +930,8 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             p_cal = result["p_calibrated"]
             p_bm = result["brownian_prob"]
 
-            # In polymarket mode, use Chainlink price only — never Binance
-            poly_mode = poly_tracker and poly_tracker.enabled
+            # Price and distance for display
             if poly_mode:
-                if poly_tracker.chainlink.price <= 0 or poly_tracker.chainlink.age > 30:
-                    age = poly_tracker.chainlink.age
-                    print(f"\r  [chainlink] No price available (age={age:.0f}s) — "
-                          f"skipping prediction  ", end="", flush=True)
-                    await asyncio.sleep(interval)
-                    continue
                 price = poly_tracker.chainlink.price
                 strike = poly_tracker.price_to_beat
                 dist = (price - strike) / strike * 10_000
@@ -978,7 +998,7 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
                     "data_incomplete": data_incomplete,
                     "data_complete_in_s": round(incomplete_secs, 0) if data_incomplete else 0,
                 }
-                if poly_tracker and poly_tracker.enabled:
+                if poly_mode:
                     ws_data["polymarket_mode"] = True
                     ws_data["price_to_beat"] = poly_tracker.price_to_beat
                     if poly_tracker.chainlink.price > 0:
@@ -1057,7 +1077,7 @@ async def main(interval=1, ws_port=8765, use_polymarket=False):
                 ws_bybit_stream(buffer, health, stop_event),
                 metrics_poller(buffer, session, stop_event),
                 polymarket_poller(poly_tracker, session, stop_event),
-                ws_chainlink_stream(poly_tracker, stop_event),
+                ws_polymarket_price_stream(poly_tracker, stop_event),
                 prediction_loop(buffer, predictor, interval, stop_event,
                                 health, ws_clients, poly_tracker),
             )

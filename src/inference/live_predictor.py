@@ -57,6 +57,44 @@ class LivePredictor:
         self.block_results = []  # list of {'return_bps': float, 'result': int}
         self.block_cache = {}  # cache static features within a block
 
+    @staticmethod
+    def _override_distance_features(feats, price_now, open_ref, seconds_to_expiry):
+        """Recalculate price-vs-strike features using an external price source."""
+        from scipy.stats import norm
+
+        # dist_to_open_bps
+        dist_bps = (price_now - open_ref) / open_ref * 10_000
+        feats["dist_to_open_bps"] = dist_bps
+
+        # dist_to_open_z
+        sigma = feats.get("realized_vol_60s", 0.0)
+        if sigma <= 0:
+            sigma = feats.get("realized_vol_since_open", 0.0)
+        if sigma > 0 and seconds_to_expiry > 0:
+            z = dist_bps / (sigma * np.sqrt(seconds_to_expiry))
+        else:
+            z = 0.0
+        feats["dist_to_open_z"] = z
+
+        # brownian_prob
+        feats["brownian_prob"] = float(norm.cdf(np.clip(z, -10, 10)))
+
+        # brownian_prob_drift
+        mu_hat = feats.get("return_30s", 0.0) / 30.0
+        if sigma > 0 and seconds_to_expiry > 0:
+            z_drift = (dist_bps + mu_hat * seconds_to_expiry) / (sigma * np.sqrt(seconds_to_expiry))
+            feats["brownian_prob_drift"] = float(norm.cdf(np.clip(z_drift, -10, 10)))
+        else:
+            feats["brownian_prob_drift"] = feats["brownian_prob"]
+
+        # z_velocity
+        return_5s = feats.get("return_5s", 0.0)
+        if sigma > 0 and seconds_to_expiry > 0:
+            z_prev = (dist_bps - return_5s) / (sigma * np.sqrt(seconds_to_expiry + 5))
+            feats["z_velocity"] = (z - z_prev) / 5.0
+        else:
+            feats["z_velocity"] = 0.0
+
     def _get_block_start(self, now_ms):
         """Get the deterministic block start for a given timestamp."""
         return (now_ms // 300_000) * 300_000
@@ -115,7 +153,8 @@ class LivePredictor:
 
         return True
 
-    def predict(self, buffer, now_ms=None, open_ref_override=None):
+    def predict(self, buffer, now_ms=None, open_ref_override=None,
+                current_price_override=None):
         """
         Compute features and predict P(Up) for the current moment.
 
@@ -124,6 +163,8 @@ class LivePredictor:
             now_ms: current timestamp in ms (default: now)
             open_ref_override: if set, use this as open_ref instead of
                                the Binance-derived one (e.g. Polymarket strike)
+            current_price_override: if set, recalculate distance-to-strike
+                               features using this price (e.g. Chainlink)
 
         Returns:
             dict with prediction info, or None if not enough data
@@ -163,6 +204,15 @@ class LivePredictor:
             block_results=self.block_results,
             block_cache=self.block_cache,
         )
+
+        # Override distance-to-strike features with external price source
+        # (e.g. Chainlink price when predicting Polymarket markets).
+        # Microstructure features stay Binance, but price-vs-strike must
+        # use the same source as the strike to avoid comparing apples to oranges.
+        if current_price_override is not None and self.open_ref > 0:
+            self._override_distance_features(
+                feats, current_price_override, self.open_ref, seconds_to_expiry
+            )
 
         # Build feature vector
         X = np.array([[feats.get(col, 0.0) for col in self.feature_cols]])
