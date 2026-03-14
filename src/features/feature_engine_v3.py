@@ -111,13 +111,16 @@ def _precompute_book(ts, bid_prices, bid_qtys, ask_prices, ask_qtys):
 # Load day data
 # ---------------------------------------------------------------------------
 
-def load_day_data(date_str, data_dir=None, time_range=None):
+def load_day_data(date_str, data_dir=None, time_range=None, lightweight=False):
     """Load all parquet streams for a day into a DayData object.
 
     Args:
         time_range: optional (start_ms, end_ms) tuple. Only keeps rows
                     within [start_ms, end_ms). Reduces RAM when only a
                     time window is needed (e.g. chunked dataset building).
+        lightweight: if True, only load mark_price + metrics + liquidations
+                     (~5 MB). Skips trades, booktickers, orderbooks, and
+                     cross-exchange data (sets them to empty arrays).
     """
     base = Path(data_dir) if data_dir else DATA_DIR
     d = base / date_str
@@ -131,57 +134,84 @@ def load_day_data(date_str, data_dir=None, time_range=None):
             df = df.loc[mask]
         return df
 
-    # --- Trades futures ---
-    df = _read(d / "trades_futures" / "full_day.parquet")
-    day.tf_ts    = df["timestamp_ms"].values.astype(np.int64)
-    day.tf_price = df["price"].values.astype(np.float64)
-    day.tf_qty   = df["qty"].values.astype(np.float64)
-    day.tf_ibm   = df["is_buyer_maker"].values
-    del df
+    _empty_ob = lambda: {'ts': np.array([], dtype=np.int64),
+                         'mid': np.array([]), 'spread_bps': np.array([]),
+                         'imb_L1': np.array([]), 'imb_L5': np.array([]),
+                         'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
+                         'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
 
-    # --- Trades spot ---
-    df = _read(d / "trades_spot" / "full_day.parquet")
-    day.ts_ts    = df["timestamp_ms"].values.astype(np.int64)
-    day.ts_price = df["price"].values.astype(np.float64)
-    day.ts_qty   = df["qty"].values.astype(np.float64)
-    day.ts_ibm   = df["is_buyer_maker"].values
-    del df
+    if lightweight:
+        # Empty arrays for heavy streams
+        day.tf_ts = day.ts_ts = day.bf_ts = day.bs_ts = np.array([], dtype=np.int64)
+        day.tf_price = day.ts_price = np.array([], dtype=np.float64)
+        day.tf_qty = day.ts_qty = np.array([], dtype=np.float64)
+        day.tf_ibm = day.ts_ibm = np.array([], dtype=bool)
+        day.bf_bid = day.bf_ask = day.bf_mid = np.array([], dtype=np.float64)
+        day.bs_bid = day.bs_ask = day.bs_mid = np.array([], dtype=np.float64)
+        day.ob_fut = _empty_ob()
+        day.ob_spot = _empty_ob()
+        day.cb_ts = day.cb_bid = day.cb_ask = day.cb_mid = np.array([], dtype=np.float64)
+        day.bb_ts = day.bb_bid = day.bb_ask = day.bb_mid = np.array([], dtype=np.float64)
+        day.ct_ts = day.ct_price = day.ct_qty = np.array([], dtype=np.float64)
+        day.ct_ibm = np.array([], dtype=bool)
+        day.bt_ts = day.bt_price = day.bt_qty = np.array([], dtype=np.float64)
+        day.bt_ibm = np.array([], dtype=bool)
+        day.ob_cb = _empty_ob()
+        day.ob_bb = _empty_ob()
+        # Fall through to load mark_price, metrics, liquidations below
 
-    # --- Bookticker futures ---
-    df = _read(d / "bookticker_futures" / "full_day.parquet")
-    day.bf_ts  = df["timestamp_ms"].values.astype(np.int64)
-    day.bf_bid = df["best_bid_price"].values.astype(np.float64)
-    day.bf_ask = df["best_ask_price"].values.astype(np.float64)
-    day.bf_mid = (day.bf_bid + day.bf_ask) / 2.0
-    del df
+    if not lightweight:
+        # --- Trades futures ---
+        df = _read(d / "trades_futures" / "full_day.parquet")
+        day.tf_ts    = df["timestamp_ms"].values.astype(np.int64)
+        day.tf_price = df["price"].values.astype(np.float64)
+        day.tf_qty   = df["qty"].values.astype(np.float64)
+        day.tf_ibm   = df["is_buyer_maker"].values
+        del df
 
-    # --- Bookticker spot ---
-    df = _read(d / "bookticker_spot" / "full_day.parquet")
-    day.bs_ts  = df["timestamp_ms"].values.astype(np.int64)
-    day.bs_bid = df["best_bid_price"].values.astype(np.float64)
-    day.bs_ask = df["best_ask_price"].values.astype(np.float64)
-    day.bs_mid = (day.bs_bid + day.bs_ask) / 2.0
-    del df
+        # --- Trades spot ---
+        df = _read(d / "trades_spot" / "full_day.parquet")
+        day.ts_ts    = df["timestamp_ms"].values.astype(np.int64)
+        day.ts_price = df["price"].values.astype(np.float64)
+        day.ts_qty   = df["qty"].values.astype(np.float64)
+        day.ts_ibm   = df["is_buyer_maker"].values
+        del df
 
-    # --- Orderbook futures (pre-computed) ---
-    df = _read(d / "orderbook_futures" / "full_day.parquet")
-    ts = df["timestamp_ms"].values.astype(np.int64)
-    bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
-    bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
-    ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
-    aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
-    day.ob_fut = _precompute_book(ts, bp, bq, ap, aq)
-    del df, ts, bp, bq, ap, aq
+        # --- Bookticker futures ---
+        df = _read(d / "bookticker_futures" / "full_day.parquet")
+        day.bf_ts  = df["timestamp_ms"].values.astype(np.int64)
+        day.bf_bid = df["best_bid_price"].values.astype(np.float64)
+        day.bf_ask = df["best_ask_price"].values.astype(np.float64)
+        day.bf_mid = (day.bf_bid + day.bf_ask) / 2.0
+        del df
 
-    # --- Orderbook spot (pre-computed) ---
-    df = _read(d / "orderbook_spot" / "full_day.parquet")
-    ts = df["timestamp_ms"].values.astype(np.int64)
-    bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
-    bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
-    ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
-    aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
-    day.ob_spot = _precompute_book(ts, bp, bq, ap, aq)
-    del df, ts, bp, bq, ap, aq
+        # --- Bookticker spot ---
+        df = _read(d / "bookticker_spot" / "full_day.parquet")
+        day.bs_ts  = df["timestamp_ms"].values.astype(np.int64)
+        day.bs_bid = df["best_bid_price"].values.astype(np.float64)
+        day.bs_ask = df["best_ask_price"].values.astype(np.float64)
+        day.bs_mid = (day.bs_bid + day.bs_ask) / 2.0
+        del df
+
+        # --- Orderbook futures (pre-computed) ---
+        df = _read(d / "orderbook_futures" / "full_day.parquet")
+        ts = df["timestamp_ms"].values.astype(np.int64)
+        bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
+        bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
+        ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
+        aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
+        day.ob_fut = _precompute_book(ts, bp, bq, ap, aq)
+        del df, ts, bp, bq, ap, aq
+
+        # --- Orderbook spot (pre-computed) ---
+        df = _read(d / "orderbook_spot" / "full_day.parquet")
+        ts = df["timestamp_ms"].values.astype(np.int64)
+        bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
+        bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
+        ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
+        aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
+        day.ob_spot = _precompute_book(ts, bp, bq, ap, aq)
+        del df, ts, bp, bq, ap, aq
 
     # --- Mark price ---
     df = _read(d / "mark_price" / "full_day.parquet")
@@ -227,101 +257,94 @@ def load_day_data(date_str, data_dir=None, time_range=None):
         day.mt_taker_ls = np.array([], dtype=np.float64)
         day.mt_oi       = np.array([], dtype=np.float64)
 
-    # --- Cross-exchange: Coinbase quotes ---
-    path = d / "coinbase_quotes" / "full_day.parquet"
-    if path.exists():
-        df = _read(path)
-        day.cb_ts  = df["timestamp_ms"].values.astype(np.int64)
-        day.cb_bid = df["best_bid_price"].values.astype(np.float64)
-        day.cb_ask = df["best_ask_price"].values.astype(np.float64)
-        day.cb_mid = (day.cb_bid + day.cb_ask) / 2.0
-        del df
-    else:
-        day.cb_ts  = np.array([], dtype=np.int64)
-        day.cb_bid = np.array([], dtype=np.float64)
-        day.cb_ask = np.array([], dtype=np.float64)
-        day.cb_mid = np.array([], dtype=np.float64)
+    if not lightweight:
+        # --- Cross-exchange: Coinbase quotes ---
+        path = d / "coinbase_quotes" / "full_day.parquet"
+        if path.exists():
+            df = _read(path)
+            day.cb_ts  = df["timestamp_ms"].values.astype(np.int64)
+            day.cb_bid = df["best_bid_price"].values.astype(np.float64)
+            day.cb_ask = df["best_ask_price"].values.astype(np.float64)
+            day.cb_mid = (day.cb_bid + day.cb_ask) / 2.0
+            del df
+        else:
+            day.cb_ts  = np.array([], dtype=np.int64)
+            day.cb_bid = np.array([], dtype=np.float64)
+            day.cb_ask = np.array([], dtype=np.float64)
+            day.cb_mid = np.array([], dtype=np.float64)
 
-    # --- Cross-exchange: Bybit quotes ---
-    path = d / "bybit_quotes" / "full_day.parquet"
-    if path.exists():
-        df = _read(path)
-        day.bb_ts  = df["timestamp_ms"].values.astype(np.int64)
-        day.bb_bid = df["best_bid_price"].values.astype(np.float64)
-        day.bb_ask = df["best_ask_price"].values.astype(np.float64)
-        day.bb_mid = (day.bb_bid + day.bb_ask) / 2.0
-        del df
-    else:
-        day.bb_ts  = np.array([], dtype=np.int64)
-        day.bb_bid = np.array([], dtype=np.float64)
-        day.bb_ask = np.array([], dtype=np.float64)
-        day.bb_mid = np.array([], dtype=np.float64)
+        # --- Cross-exchange: Bybit quotes ---
+        path = d / "bybit_quotes" / "full_day.parquet"
+        if path.exists():
+            df = _read(path)
+            day.bb_ts  = df["timestamp_ms"].values.astype(np.int64)
+            day.bb_bid = df["best_bid_price"].values.astype(np.float64)
+            day.bb_ask = df["best_ask_price"].values.astype(np.float64)
+            day.bb_mid = (day.bb_bid + day.bb_ask) / 2.0
+            del df
+        else:
+            day.bb_ts  = np.array([], dtype=np.int64)
+            day.bb_bid = np.array([], dtype=np.float64)
+            day.bb_ask = np.array([], dtype=np.float64)
+            day.bb_mid = np.array([], dtype=np.float64)
 
-    # --- Cross-exchange: Coinbase trades ---
-    path = d / "coinbase_trades" / "full_day.parquet"
-    if path.exists():
-        df = _read(path)
-        day.ct_ts    = df["timestamp_ms"].values.astype(np.int64)
-        day.ct_price = df["price"].values.astype(np.float64)
-        day.ct_qty   = df["qty"].values.astype(np.float64)
-        day.ct_ibm   = df["is_buyer_maker"].values
-        del df
-    else:
-        day.ct_ts    = np.array([], dtype=np.int64)
-        day.ct_price = np.array([], dtype=np.float64)
-        day.ct_qty   = np.array([], dtype=np.float64)
-        day.ct_ibm   = np.array([], dtype=bool)
+        # --- Cross-exchange: Coinbase trades ---
+        path = d / "coinbase_trades" / "full_day.parquet"
+        if path.exists():
+            df = _read(path)
+            day.ct_ts    = df["timestamp_ms"].values.astype(np.int64)
+            day.ct_price = df["price"].values.astype(np.float64)
+            day.ct_qty   = df["qty"].values.astype(np.float64)
+            day.ct_ibm   = df["is_buyer_maker"].values
+            del df
+        else:
+            day.ct_ts    = np.array([], dtype=np.int64)
+            day.ct_price = np.array([], dtype=np.float64)
+            day.ct_qty   = np.array([], dtype=np.float64)
+            day.ct_ibm   = np.array([], dtype=bool)
 
-    # --- Cross-exchange: Bybit trades ---
-    path = d / "bybit_trades" / "full_day.parquet"
-    if path.exists():
-        df = _read(path)
-        day.bt_ts    = df["timestamp_ms"].values.astype(np.int64)
-        day.bt_price = df["price"].values.astype(np.float64)
-        day.bt_qty   = df["qty"].values.astype(np.float64)
-        day.bt_ibm   = df["is_buyer_maker"].values
-        del df
-    else:
-        day.bt_ts    = np.array([], dtype=np.int64)
-        day.bt_price = np.array([], dtype=np.float64)
-        day.bt_qty   = np.array([], dtype=np.float64)
-        day.bt_ibm   = np.array([], dtype=bool)
+        # --- Cross-exchange: Bybit trades ---
+        path = d / "bybit_trades" / "full_day.parquet"
+        if path.exists():
+            df = _read(path)
+            day.bt_ts    = df["timestamp_ms"].values.astype(np.int64)
+            day.bt_price = df["price"].values.astype(np.float64)
+            day.bt_qty   = df["qty"].values.astype(np.float64)
+            day.bt_ibm   = df["is_buyer_maker"].values
+            del df
+        else:
+            day.bt_ts    = np.array([], dtype=np.int64)
+            day.bt_price = np.array([], dtype=np.float64)
+            day.bt_qty   = np.array([], dtype=np.float64)
+            day.bt_ibm   = np.array([], dtype=bool)
 
-    # --- Cross-exchange: Coinbase orderbook (from incremental L2) ---
-    path = d / "coinbase_book_l2" / "full_day.parquet"
-    if path.exists():
-        df = _read(path)
-        ts = df["timestamp_ms"].values.astype(np.int64)
-        bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
-        bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
-        ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
-        aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
-        day.ob_cb = _precompute_book(ts, bp, bq, ap, aq)
-        del df, ts, bp, bq, ap, aq
-    else:
-        day.ob_cb = {'ts': np.array([], dtype=np.int64),
-                     'mid': np.array([]), 'spread_bps': np.array([]),
-                     'imb_L1': np.array([]), 'imb_L5': np.array([]),
-                     'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
-                     'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
+        # --- Cross-exchange: Coinbase orderbook (from incremental L2) ---
+        path = d / "coinbase_book_l2" / "full_day.parquet"
+        if path.exists():
+            df = _read(path)
+            ts = df["timestamp_ms"].values.astype(np.int64)
+            bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
+            bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
+            ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
+            aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
+            day.ob_cb = _precompute_book(ts, bp, bq, ap, aq)
+            del df, ts, bp, bq, ap, aq
+        else:
+            day.ob_cb = _empty_ob()
 
-    # --- Cross-exchange: Bybit orderbook ---
-    path = d / "bybit_orderbook" / "full_day.parquet"
-    if path.exists():
-        df = _read(path)
-        ts = df["timestamp_ms"].values.astype(np.int64)
-        bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
-        bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
-        ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
-        aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
-        day.ob_bb = _precompute_book(ts, bp, bq, ap, aq)
-        del df, ts, bp, bq, ap, aq
-    else:
-        day.ob_bb = {'ts': np.array([], dtype=np.int64),
-                     'mid': np.array([]), 'spread_bps': np.array([]),
-                     'imb_L1': np.array([]), 'imb_L5': np.array([]),
-                     'bid_prices': np.empty((0, 20)), 'bid_qtys': np.empty((0, 20)),
-                     'ask_prices': np.empty((0, 20)), 'ask_qtys': np.empty((0, 20))}
+        # --- Cross-exchange: Bybit orderbook ---
+        path = d / "bybit_orderbook" / "full_day.parquet"
+        if path.exists():
+            df = _read(path)
+            ts = df["timestamp_ms"].values.astype(np.int64)
+            bp = np.column_stack([df[f"bid_price_{i}"].values for i in range(20)])
+            bq = np.column_stack([df[f"bid_qty_{i}"].values for i in range(20)])
+            ap = np.column_stack([df[f"ask_price_{i}"].values for i in range(20)])
+            aq = np.column_stack([df[f"ask_qty_{i}"].values for i in range(20)])
+            day.ob_bb = _precompute_book(ts, bp, bq, ap, aq)
+            del df, ts, bp, bq, ap, aq
+        else:
+            day.ob_bb = _empty_ob()
 
     return day
 

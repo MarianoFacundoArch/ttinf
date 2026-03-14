@@ -173,13 +173,14 @@ def _merge_day_data(main_day, extra_day, prepend=True):
     return main_day
 
 
-def _load_day_safe(date_str, data_dir, time_range=None):
+def _load_day_safe(date_str, data_dir, time_range=None, lightweight=False):
     """Load day data, return None if directory doesn't exist."""
     d = Path(data_dir) / date_str
     if not d.exists():
         return None
     try:
-        return load_day_data(date_str, data_dir=data_dir, time_range=time_range)
+        return load_day_data(date_str, data_dir=data_dir, time_range=time_range,
+                             lightweight=lightweight)
     except Exception:
         return None
 
@@ -239,17 +240,18 @@ def process_day(date_str, data_dir=None, output_dir=None):
     day_end_ms   = day_start_ms + 86_400_000
 
     # --- Step 1: Build ref_price + keep lightweight data ---
-    # Load full day + borders to build ref_price and keep metrics/liquidations
-    # (these are tiny: metrics ~288 rows, liquidations ~few hundred).
-    day_full = load_day_data(date_str, data_dir=data_dir)
+    # Load only mark_price + metrics + liquidations (~5 MB instead of ~2 GB).
+    # ref_price only needs mark_price (index_price). Heavy streams (trades,
+    # orderbooks, booktickers) are loaded per-chunk in Step 3.
+    day_full = load_day_data(date_str, data_dir=data_dir, lightweight=True)
     prev_date = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
-    prev_day = _load_day_safe(prev_date, data_dir)
+    prev_day = _load_day_safe(prev_date, data_dir, lightweight=True)
     if prev_day is not None:
         cutoff = day_start_ms - 1_800_000
         _filter_day_after(prev_day, cutoff)
         day_full = _merge_day_data(day_full, prev_day, prepend=True)
     next_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-    next_day = _load_day_safe(next_date, data_dir)
+    next_day = _load_day_safe(next_date, data_dir, lightweight=True)
     if next_day is not None:
         cutoff = day_end_ms + 300_000
         _filter_day_before(next_day, cutoff)
