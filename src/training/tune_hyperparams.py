@@ -47,7 +47,7 @@ STEP_DAYS = 7
 EMBARGO_BLOCKS = 2
 
 # Training
-MAX_BOOST_ROUND = 5000
+MAX_BOOST_ROUND = 10000
 FEATURE_COLS = FEATURE_COLUMNS_V3
 
 
@@ -214,17 +214,17 @@ def objective(trial, df):
         "num_threads": -1,
 
         # Tuned parameters
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-        "max_depth": trial.suggest_int("max_depth", 3, 12),
-        "min_child_samples": trial.suggest_int("min_child_samples", 20, 500),
-        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "learning_rate": trial.suggest_float("learning_rate", 0.001, 0.1, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 7, 255),
+        "max_depth": trial.suggest_int("max_depth", 2, 15),
+        "min_child_samples": trial.suggest_int("min_child_samples", 50, 2000),
+        "subsample": trial.suggest_float("subsample", 0.3, 1.0),
         "subsample_freq": 1,
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-        "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 2.0),
-        "max_bin": trial.suggest_categorical("max_bin", [127, 255, 511]),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.2, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 50.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 50.0, log=True),
+        "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 5.0),
+        "max_bin": trial.suggest_categorical("max_bin", [63, 127, 255, 511]),
     }
 
     mean_auc, mean_acc = walk_forward_objective(params, df, trial=trial)
