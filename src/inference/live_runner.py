@@ -22,6 +22,9 @@ import certifi
 import websockets
 import aiohttp
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from src.inference.live_buffer import LiveBuffer
 from src.inference.live_predictor import LivePredictor
@@ -64,6 +67,11 @@ class PolymarketTracker:
         self.enabled = False          # Set to True to activate
         self.chainlink = ChainlinkPriceFeed()  # Real-time Chainlink price
 
+        # Previous block close tracking
+        self._pending_close_ts = None   # block_open_ts of block awaiting close
+        self._pending_close_strike = None  # strike of that block
+        self.last_close_result = None   # dict with close info once resolved
+
     def get_block_open_ts(self, now_sec=None):
         """Get the current block's open timestamp in seconds."""
         if now_sec is None:
@@ -74,18 +82,22 @@ class PolymarketTracker:
         """Check if we entered a new block. Returns True if block changed."""
         block_ts = self.get_block_open_ts()
         if block_ts != self.current_open_ts:
+            # Queue previous block for close result polling
+            if self.current_open_ts > 0 and self.price_to_beat is not None:
+                self._pending_close_ts = self.current_open_ts
+                self._pending_close_strike = self.price_to_beat
+                self.last_close_result = None
             self.current_open_ts = block_ts
             self.price_to_beat = None
             self._polling = True
             return True
         return False
 
-    def get_api_url(self):
-        """Build the Polymarket crypto-price API URL for current block."""
-        open_dt = datetime.fromtimestamp(self.current_open_ts, tz=timezone.utc)
-        close_dt = datetime.fromtimestamp(
-            self.current_open_ts + self.interval_sec, tz=timezone.utc
-        )
+    def get_api_url(self, block_open_ts=None):
+        """Build the Polymarket crypto-price API URL for a block."""
+        ts = block_open_ts if block_open_ts else self.current_open_ts
+        open_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        close_dt = datetime.fromtimestamp(ts + self.interval_sec, tz=timezone.utc)
         open_iso = open_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         close_iso = close_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         return (
@@ -97,7 +109,7 @@ class PolymarketTracker:
 
 
 async def polymarket_poller(tracker, session, stop_event):
-    """Poll Polymarket API for price_to_beat when a new block starts."""
+    """Poll Polymarket API for price_to_beat and previous block close result."""
     if not tracker.enabled:
         return
 
@@ -106,7 +118,7 @@ async def polymarket_poller(tracker, session, stop_event):
             # Check for new block
             tracker.check_new_block()
 
-            # Poll if we need the price
+            # 1) Poll for current block's price_to_beat
             if tracker._polling and tracker.price_to_beat is None:
                 url = tracker.get_api_url()
                 try:
@@ -124,11 +136,36 @@ async def polymarket_poller(tracker, session, stop_event):
                                       f"price_to_beat = ${tracker.price_to_beat:,.2f}")
                 except Exception:
                     pass  # Silent retry
-
-                # Poll every 500ms until found
                 await asyncio.sleep(0.5)
+
+            # 2) Poll for previous block's close result
+            elif tracker._pending_close_ts is not None:
+                url = tracker.get_api_url(tracker._pending_close_ts)
+                try:
+                    async with session.get(url, ssl=SSL_CONTEXT, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            if data.get("completed") and data.get("closePrice"):
+                                cp = float(data["closePrice"])
+                                op = float(data.get("openPrice", tracker._pending_close_strike))
+                                ret_bps = (cp - op) / op * 10_000
+                                outcome = "UP" if cp >= op else "DOWN"
+                                tracker.last_close_result = {
+                                    "close_price": cp,
+                                    "open_price": op,
+                                    "return_bps": ret_bps,
+                                    "outcome": outcome,
+                                }
+                                print(f"\n  >> CLOSED (Polymarket): {cp:,.2f}  |  "
+                                      f"strike: {op:,.2f}  |  "
+                                      f"{ret_bps:+.2f} bps  |  {outcome}")
+                                tracker._pending_close_ts = None
+                except Exception:
+                    pass  # Silent retry
+                await asyncio.sleep(1)
+
             else:
-                # No need to poll — check every 1s for new blocks
+                # Nothing to poll — check every 1s for new blocks
                 await asyncio.sleep(1)
 
         except Exception as e:
@@ -204,7 +241,7 @@ SPOT_REST = "https://api.binance.com"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 # Cross-exchange websockets
-COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
+COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
 BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
 
 
@@ -696,112 +733,141 @@ async def ws_spot_stream(buffer, health, stop_event):
                 await asyncio.sleep(2)
 
 
-def _coinbase_auth_headers():
-    """Build Coinbase WS auth signature if API keys are configured.
+def _coinbase_jwt():
+    """Build JWT for Coinbase Advanced Trade WS (CDP API keys).
 
     Reads from environment variables:
-        COINBASE_API_KEY, COINBASE_API_SECRET, COINBASE_API_PASSPHRASE
+        COINBASE_API_KEY    — e.g. organizations/{org}/apiKeys/{key_id}
+        COINBASE_API_SECRET — EC private key in PEM format
 
-    Returns dict with auth fields for the subscribe message, or empty dict.
+    Returns JWT string, or empty string if not configured.
     """
-    import os, hmac, hashlib, base64
-    key = os.environ.get("COINBASE_API_KEY", "")
-    secret = os.environ.get("COINBASE_API_SECRET", "")
-    passphrase = os.environ.get("COINBASE_API_PASSPHRASE", "")
-    if not (key and secret and passphrase):
-        return {}
-    timestamp = str(int(time.time()))
-    message = timestamp + "GET" + "/users/self/verify"
-    signature = base64.b64encode(
-        hmac.new(base64.b64decode(secret), message.encode(), hashlib.sha256).digest()
-    ).decode()
-    return {
-        "key": key,
-        "signature": signature,
-        "timestamp": timestamp,
-        "passphrase": passphrase,
-    }
+    import os, hashlib, secrets as _secrets
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives import serialization
+
+    key_name = os.environ.get("COINBASE_API_KEY", "")
+    key_secret = os.environ.get("COINBASE_API_SECRET", "")
+    if not (key_name and key_secret):
+        return ""
+
+    # Handle escaped newlines from .env
+    key_secret = key_secret.replace("\\n", "\n")
+
+    try:
+        private_key = serialization.load_pem_private_key(
+            key_secret.encode("utf-8"), password=None
+        )
+        payload = {
+            "sub": key_name,
+            "iss": "coinbase-cloud",
+            "nbf": int(time.time()),
+            "exp": int(time.time()) + 120,
+        }
+        headers = {
+            "kid": key_name,
+            "nonce": hashlib.sha256(os.urandom(16)).hexdigest(),
+        }
+        return pyjwt.encode(payload, private_key, algorithm="ES256", headers=headers)
+    except Exception as e:
+        print(f"[coinbase] JWT generation failed: {e}")
+        return ""
 
 
 async def ws_coinbase_stream(buffer, health, stop_event):
-    """Connect to Coinbase websocket for BTC-USD quotes, trades, and L2 book.
+    """Connect to Coinbase Advanced Trade WS for BTC-USD ticker, trades, and L2.
 
-    L2 orderbook requires authentication (API keys via env vars).
-    Without keys, only ticker and matches channels are subscribed.
+    Uses JWT auth with EC private key (CDP API keys).
+    Each subscribe message needs a fresh JWT (expires in 2 min).
+    Without keys, subscribes to ticker and market_trades only (no L2).
     """
-    auth = _coinbase_auth_headers()
-    channels = ["ticker", "matches"]
-    if auth:
+    has_auth = bool(_coinbase_jwt())
+    channels = ["ticker", "market_trades"]
+    if has_auth:
         channels.append("level2")
-        print("[coinbase] L2 auth configured — subscribing to level2")
+        print("[coinbase] JWT auth OK — subscribing to level2")
     else:
-        print("[coinbase] no API keys — skipping level2 (set COINBASE_API_KEY/SECRET/PASSPHRASE)")
+        print("[coinbase] no API keys — skipping level2 (set COINBASE_API_KEY/SECRET)")
 
-    sub_msg = json.dumps({
-        "type": "subscribe",
-        "product_ids": ["BTC-USD"],
-        "channels": channels,
-        **auth,
-    })
+    def _make_sub_msg(channel):
+        """Build subscribe message with fresh JWT for one channel."""
+        msg = {
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channel": channel,
+        }
+        token = _coinbase_jwt()
+        if token:
+            msg["jwt"] = token
+        return json.dumps(msg)
 
     while not stop_event.is_set():
         try:
             async with websockets.connect(COINBASE_WS, ssl=SSL_CONTEXT,
                                           ping_interval=30,
                                           ping_timeout=20,
-                                          max_size=2**22) as ws:
-                await ws.send(sub_msg)
+                                          max_size=2**24) as ws:
+                for ch in channels:
+                    await ws.send(_make_sub_msg(ch))
+
                 async for msg in ws:
                     if stop_event.is_set():
                         break
                     try:
                         d = json.loads(msg)
-                        msg_type = d.get("type", "")
+                        channel = d.get("channel", "")
+                        events = d.get("events", [])
 
-                        if msg_type == "ticker":
-                            ts = int(time.time() * 1000)
-                            bid = float(d["best_bid"])
-                            ask = float(d["best_ask"])
-                            buffer.add_coinbase_quote(ts, bid, ask)
-                            # Also record as trade from ticker price/size
-                            price = float(d.get("price", 0))
-                            size = float(d.get("last_size", 0))
-                            if price > 0 and size > 0:
-                                ibm = d.get("side", "buy") == "sell"
-                                buffer.add_coinbase_trade(ts, price, size, ibm)
-                            health.update("coinbase")
+                        for event in events:
+                            evt_type = event.get("type", "")
 
-                        elif msg_type in ("match", "last_match"):
-                            ts = int(time.time() * 1000)
-                            price = float(d["price"])
-                            qty = float(d["size"])
-                            # side = taker side: "sell" → buyer was maker
-                            ibm = d.get("side", "buy") == "sell"
-                            buffer.add_coinbase_trade(ts, price, qty, ibm)
-                            health.update("coinbase")
+                            if channel == "ticker" and "tickers" in event:
+                                for t in event["tickers"]:
+                                    ts = int(time.time() * 1000)
+                                    bid = float(t.get("best_bid", 0))
+                                    ask = float(t.get("best_ask", 0))
+                                    if bid > 0 and ask > 0:
+                                        buffer.add_coinbase_quote(ts, bid, ask)
+                                    price = float(t.get("price", 0))
+                                    vol = float(t.get("volume_24_h", 0))
+                                    if price > 0:
+                                        buffer.add_coinbase_trade(ts, price, 0.0, False)
+                                    health.update("coinbase")
 
-                        elif msg_type == "snapshot":
-                            # L2 book snapshot (initial)
-                            ts = int(time.time() * 1000)
-                            bids = d.get("bids", [])
-                            asks = d.get("asks", [])
-                            buffer.update_coinbase_book(True, bids, asks, ts)
-                            health.update("coinbase")
+                            elif channel == "market_trades" and "trades" in event:
+                                for t in event["trades"]:
+                                    ts = int(time.time() * 1000)
+                                    price = float(t["price"])
+                                    qty = float(t["size"])
+                                    ibm = t.get("side", "BUY") == "SELL"
+                                    buffer.add_coinbase_trade(ts, price, qty, ibm)
+                                    health.update("coinbase")
 
-                        elif msg_type == "l2update":
-                            # L2 incremental update
-                            ts = int(time.time() * 1000)
-                            changes = d.get("changes", [])
-                            bids = [(c[1], c[2]) for c in changes if c[0] == "buy"]
-                            asks = [(c[1], c[2]) for c in changes if c[0] == "sell"]
-                            buffer.update_coinbase_book(False, bids, asks, ts)
-                            health.update("coinbase")
+                            elif channel == "l2_data" and evt_type == "snapshot":
+                                ts = int(time.time() * 1000)
+                                updates = event.get("updates", [])
+                                bids = [(u["price_level"], u["new_quantity"])
+                                        for u in updates if u.get("side") == "bid"]
+                                asks = [(u["price_level"], u["new_quantity"])
+                                        for u in updates if u.get("side") == "offer"]
+                                buffer.update_coinbase_book(True, bids, asks, ts)
+                                health.update("coinbase")
 
-                        elif msg_type == "error":
-                            print(f"\n[coinbase] subscription error: {d.get('message', '?')} — {d.get('reason', '?')}")
+                            elif channel == "l2_data" and evt_type == "update":
+                                ts = int(time.time() * 1000)
+                                updates = event.get("updates", [])
+                                bids = [(u["price_level"], u["new_quantity"])
+                                        for u in updates if u.get("side") == "bid"]
+                                asks = [(u["price_level"], u["new_quantity"])
+                                        for u in updates if u.get("side") == "offer"]
+                                buffer.update_coinbase_book(False, bids, asks, ts)
+                                health.update("coinbase")
+
+                        if d.get("type") == "error":
+                            print(f"\n[coinbase] error: {d.get('message', '?')} — {d.get('reason', '?')}")
 
                     except (KeyError, ValueError) as e:
-                        _log_ws_error("coinbase", msg_type, e)
+                        _log_ws_error("coinbase", channel, e)
         except Exception as e:
             if not stop_event.is_set():
                 print(f"\n[coinbase ws] reconnecting: {e}")
@@ -990,13 +1056,16 @@ async def prediction_loop(buffer, predictor, interval, stop_event,
             # New block?
             if result["block_start_ms"] != last_block:
                 # Show close summary of previous block
-                if last_block > 0 and len(predictor.block_results) > 0:
-                    prev = predictor.block_results[0]
-                    outcome = "UP" if prev['result'] == 1 else "DOWN"
-                    print(f"\n  >> CLOSED: {prev['close_ref']:,.2f}  |  "
-                          f"open: {prev['open_ref']:,.2f}  |  "
-                          f"{prev['return_bps']:+.2f} bps  |  "
-                          f"{outcome}")
+                if last_block > 0 and not poly_mode:
+                    # Non-Polymarket: use Binance index_price
+                    if len(predictor.block_results) > 0:
+                        prev = predictor.block_results[0]
+                        outcome = "UP" if prev['result'] == 1 else "DOWN"
+                        print(f"\n  >> CLOSED: {prev['close_ref']:,.2f}  |  "
+                              f"open: {prev['open_ref']:,.2f}  |  "
+                              f"{prev['return_bps']:+.2f} bps  |  "
+                              f"{outcome}")
+                # Polymarket close is printed by polymarket_poller when API confirms
 
                 last_block = result["block_start_ms"]
                 block_count += 1

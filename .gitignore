@@ -31,6 +31,10 @@ Thumbs.db
 # Compiled binaries
 tools/book_builder
 
+# Environment / secrets
+.env
+.env.*
+
 # Misc
 *.log
 *.tmp
